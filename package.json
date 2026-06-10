@@ -1,11 +1,41 @@
 {
   "name": "@langfuse/opencode-observability-plugin",
   "version": "0.1.0",
+  "description": "OpenCode plugin that sends session telemetry to Langfuse.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
   "type": "module",
-  "author": "bezbac",
-  "private": true,
+  "author": "Langfuse",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/langfuse/opencode-observability-plugin.git"
+  },
+  "bugs": {
+    "url": "https://github.com/langfuse/opencode-observability-plugin/issues"
+  },
+  "homepage": "https://github.com/langfuse/opencode-observability-plugin#readme",
+  "keywords": [
+    "langfuse",
+    "opencode",
+    "plugin",
+    "observability",
+    "opentelemetry"
+  ],
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "build": "tsc",
     "format": "prettier --write .",
