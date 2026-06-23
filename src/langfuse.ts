@@ -136,41 +136,17 @@ export class LangfuseClient {
   }
 
   traceReasoningPart(part: MessagePart) {
-    const candidate = part as MessagePart & {
-      id?: unknown;
-      messageID?: unknown;
-      sessionID?: unknown;
-      text?: unknown;
-      time?: { start?: unknown; end?: unknown };
-    };
-
-    if (candidate.type !== "reasoning") {
-      return;
-    }
-
-    if (
-      typeof candidate.id !== "string" ||
-      typeof candidate.sessionID !== "string" ||
-      typeof candidate.text !== "string"
-    ) {
-      return;
-    }
-
-    // message.part.updated can stream partial reasoning. Trace only the
-    // completed part so Langfuse gets one stable reasoning event per part.
-    if (typeof candidate.time?.end !== "number") {
+    if (!isCompletedReasoningPart(part)) {
       return;
     }
 
     this.traceReasoning({
-      reasoningID: candidate.id,
-      sessionID: candidate.sessionID,
-      timestamp: candidate.time.end,
-      text: candidate.text,
+      reasoningID: part.id,
+      sessionID: part.sessionID,
+      timestamp: part.time.end,
+      text: part.text,
       messageID:
-        typeof candidate.messageID === "string"
-          ? candidate.messageID
-          : undefined,
+        typeof part.messageID === "string" ? part.messageID : undefined,
       source: "message.part.updated",
     });
   }
@@ -700,6 +676,26 @@ export type MessagePart = Extract<
   Parameters<NonNullable<Hooks["event"]>>[0]["event"],
   { type: "message.part.updated" }
 >["properties"]["part"];
+
+type CompletedReasoningPart = MessagePart & {
+  id: string;
+  sessionID: string;
+  text: string;
+  messageID?: string;
+  time: { end: number };
+};
+
+function isCompletedReasoningPart(
+  part: MessagePart,
+): part is CompletedReasoningPart {
+  return (
+    part.type === "reasoning" &&
+    typeof part.id === "string" &&
+    typeof part.sessionID === "string" &&
+    typeof part.text === "string" &&
+    typeof (part as { time?: { end?: unknown } }).time?.end === "number"
+  );
+}
 
 export type FormattedMessagePart =
   | { type: string; text: string }
