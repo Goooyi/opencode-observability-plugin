@@ -33,6 +33,7 @@ export class LangfuseClient {
   clearTraceState() {
     this.traceState.assistantParts.clear();
     this.traceState.tracedEventIds.clear();
+    this.traceState.tracedReasoningIds.clear();
     this.traceState.generationParentSpans.clear();
     this.traceState.turnObservationsByMessageId.clear();
     this.traceState.latestTurnObservationsBySession.clear();
@@ -97,6 +98,80 @@ export class LangfuseClient {
       });
 
       span.end(new Date(input.timestamp));
+    });
+  }
+
+  traceReasoning(input: {
+    reasoningID: string;
+    sessionID: string;
+    timestamp: number;
+    text: string;
+    messageID?: string;
+    source: string;
+  }) {
+    if (!input.text.trim()) {
+      return;
+    }
+
+    const reasoningTraceKey = `${input.sessionID}:${input.reasoningID}`;
+
+    if (this.traceState.tracedReasoningIds.has(reasoningTraceKey)) {
+      return;
+    }
+
+    this.traceState.tracedReasoningIds.add(reasoningTraceKey);
+
+    this.traceEvent({
+      id: `reasoning:${reasoningTraceKey}`,
+      sessionID: input.sessionID,
+      name: "opencode.generation.reasoning",
+      timestamp: input.timestamp,
+      output: { text: input.text },
+      metadata: {
+        reasoningID: input.reasoningID,
+        messageID: input.messageID,
+        source: input.source,
+      },
+    });
+  }
+
+  traceReasoningPart(part: MessagePart) {
+    const candidate = part as MessagePart & {
+      id?: unknown;
+      messageID?: unknown;
+      sessionID?: unknown;
+      text?: unknown;
+      time?: { start?: unknown; end?: unknown };
+    };
+
+    if (candidate.type !== "reasoning") {
+      return;
+    }
+
+    if (
+      typeof candidate.id !== "string" ||
+      typeof candidate.sessionID !== "string" ||
+      typeof candidate.text !== "string"
+    ) {
+      return;
+    }
+
+    // message.part.updated can stream partial reasoning. Trace only the
+    // completed part so Langfuse gets one stable reasoning event per part.
+    if (typeof candidate.time?.end !== "number") {
+      return;
+    }
+
+    this.traceReasoning({
+      reasoningID: candidate.id,
+      sessionID: candidate.sessionID,
+      timestamp: candidate.time.end,
+      text: candidate.text,
+      messageID:
+        typeof candidate.messageID === "string"
+          ? candidate.messageID
+          : undefined,
+      source: "message.part.updated",
     });
   }
 
@@ -612,6 +687,7 @@ export type LangfuseTraceState = {
   tracedMessageIds: Set<string>;
   tracedGenerationIds: Set<string>;
   tracedEventIds: Set<string>;
+  tracedReasoningIds: Set<string>;
   assistantParts: Map<string, Map<string, MessagePart>>;
   turnObservationsByMessageId: Map<string, TurnObservation>;
   latestTurnObservationsBySession: Map<string, TurnObservation>;
@@ -719,6 +795,7 @@ export const createLangfuseClient = (input: {
       tracedMessageIds: new Set<string>(),
       tracedGenerationIds: new Set<string>(),
       tracedEventIds: new Set<string>(),
+      tracedReasoningIds: new Set<string>(),
       assistantParts: new Map<string, Map<string, MessagePart>>(),
       turnObservationsByMessageId: new Map<string, TurnObservation>(),
       latestTurnObservationsBySession: new Map<string, TurnObservation>(),
