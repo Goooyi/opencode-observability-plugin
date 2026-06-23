@@ -11,7 +11,7 @@ Enable the plugin in your `opencode.json` or `opencode.jsonc`:
   "experimental": {
     "openTelemetry": true
   },
-  "plugin": ["@langfuse/opencode-observability-plugin@latest"]
+  "plugin": ["@goooyi/opencode-observability-plugin@latest"]
 }
 ```
 

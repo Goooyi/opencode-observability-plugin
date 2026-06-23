@@ -1,7 +1,7 @@
 {
-  "name": "@langfuse/opencode-observability-plugin",
+  "name": "@goooyi/opencode-observability-plugin",
   "version": "0.1.0",
-  "description": "OpenCode plugin that sends session telemetry to Langfuse.",
+  "description": "OpenCode plugin that sends session telemetry and reasoning parts to Langfuse.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "exports": {
@@ -11,16 +11,16 @@
     }
   },
   "type": "module",
-  "author": "Langfuse",
+  "author": "Langfuse, fork maintained by Goooyi",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/langfuse/opencode-observability-plugin.git"
+    "url": "git+https://github.com/Goooyi/opencode-observability-plugin.git"
   },
   "bugs": {
-    "url": "https://github.com/langfuse/opencode-observability-plugin/issues"
+    "url": "https://github.com/Goooyi/opencode-observability-plugin/issues"
   },
-  "homepage": "https://github.com/langfuse/opencode-observability-plugin#readme",
+  "homepage": "https://github.com/Goooyi/opencode-observability-plugin#readme",
   "keywords": [
     "langfuse",
     "opencode",
