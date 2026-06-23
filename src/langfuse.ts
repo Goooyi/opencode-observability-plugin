@@ -32,6 +32,7 @@ export class LangfuseClient {
 
   clearTraceState() {
     this.traceState.assistantParts.clear();
+    this.traceState.toolCallMessageIds.clear();
     this.traceState.tracedEventIds.clear();
     this.traceState.tracedReasoningIds.clear();
     this.traceState.pendingReasoningPartsByMessageId.clear();
@@ -111,7 +112,7 @@ export class LangfuseClient {
       return;
     }
 
-    this.withObservationParent(input.sessionID, startEvent);
+    this.withObservationParent(input.sessionID, undefined, startEvent);
   }
 
   traceReasoning(input: {
@@ -373,6 +374,10 @@ export class LangfuseClient {
       return;
     }
 
+    if (part.type === "tool" && part.callID) {
+      this.traceState.toolCallMessageIds.set(part.callID, part.messageID);
+    }
+
     const parts =
       this.traceState.assistantParts.get(part.messageID) ??
       new Map<string, MessagePart>();
@@ -457,6 +462,7 @@ export class LangfuseClient {
       this.flushPendingReasoning(input.messageID, step.span);
       step.span.end(new Date(input.completed));
       this.traceState.activeGenerationSteps.delete(input.sessionID);
+      this.traceState.generationParentSpans.delete(input.sessionID);
 
       return;
     }
@@ -500,6 +506,7 @@ export class LangfuseClient {
       this.traceState.generationSpansByMessageId.set(input.messageID, span);
       this.flushPendingReasoning(input.messageID, span);
       span.end(new Date(input.completed));
+      this.traceState.generationParentSpans.delete(input.sessionID);
     });
   }
 
@@ -556,6 +563,7 @@ export class LangfuseClient {
       step.span.recordException(input.error);
       step.span.end(new Date(input.completed));
       this.traceState.activeGenerationSteps.delete(input.sessionID);
+      this.traceState.generationParentSpans.delete(input.sessionID);
 
       return;
     }
@@ -582,6 +590,7 @@ export class LangfuseClient {
       span.recordException(input.error);
       this.traceState.generationParentSpans.set(input.sessionID, span);
       span.end(new Date(input.completed));
+      this.traceState.generationParentSpans.delete(input.sessionID);
     });
   }
 
@@ -590,11 +599,14 @@ export class LangfuseClient {
     callID: string;
     tool: string;
     args: unknown;
+    messageID?: string;
   }) {
     this.traceState.activeToolObservations.get(input.callID)?.span.end();
-    this.ensureGenerationParent(input.sessionID);
+    const messageID =
+      input.messageID ?? this.traceState.toolCallMessageIds.get(input.callID);
+    this.ensureGenerationParent(input.sessionID, messageID);
 
-    this.withObservationParent(input.sessionID, () => {
+    this.withObservationParent(input.sessionID, messageID, () => {
       const span = this.traceState.tracer.startSpan(input.tool, {
         attributes: {
           "langfuse.observation.type": "tool",
@@ -603,6 +615,7 @@ export class LangfuseClient {
           "langfuse.observation.metadata": JSON.stringify({
             callID: input.callID,
             tool: input.tool,
+            messageID,
           }),
         },
       });
@@ -622,6 +635,7 @@ export class LangfuseClient {
     args: unknown;
     title: string;
     output: string;
+    messageID?: string;
   }) {
     if (!this.traceState.activeToolObservations.has(input.callID)) {
       this.traceToolStart({
@@ -629,6 +643,7 @@ export class LangfuseClient {
         callID: input.callID,
         tool: input.tool,
         args: input.args,
+        messageID: input.messageID,
       });
     }
 
@@ -647,6 +662,9 @@ export class LangfuseClient {
       JSON.stringify({
         callID: input.callID,
         tool: input.tool,
+        messageID:
+          input.messageID ??
+          this.traceState.toolCallMessageIds.get(input.callID),
       }),
     );
 
@@ -654,8 +672,10 @@ export class LangfuseClient {
     this.traceState.activeToolObservations.delete(input.callID);
   }
 
-  private ensureGenerationParent(sessionID: string) {
+  private ensureGenerationParent(sessionID: string, messageID?: string) {
     if (
+      (messageID &&
+        this.traceState.generationSpansByMessageId.has(messageID)) ||
       this.traceState.activeGenerationSteps.has(sessionID) ||
       this.traceState.generationParentSpans.has(sessionID)
     ) {
@@ -691,8 +711,15 @@ export class LangfuseClient {
       : fn();
   }
 
-  private withObservationParent<T>(sessionID: string, fn: () => T) {
+  private withObservationParent<T>(
+    sessionID: string,
+    messageID: string | undefined,
+    fn: () => T,
+  ) {
     const parentSpan =
+      (messageID
+        ? this.traceState.generationSpansByMessageId.get(messageID)
+        : undefined) ??
       this.traceState.activeGenerationSteps.get(sessionID)?.span ??
       this.traceState.generationParentSpans.get(sessionID);
 
@@ -721,6 +748,7 @@ export type LangfuseTraceState = {
   tracedGenerationIds: Set<string>;
   tracedEventIds: Set<string>;
   tracedReasoningIds: Set<string>;
+  toolCallMessageIds: Map<string, string>;
   pendingReasoningPartsByMessageId: Map<string, CompletedReasoningPart[]>;
   generationSpansByMessageId: Map<string, ApiSpan>;
   assistantParts: Map<string, Map<string, MessagePart>>;
@@ -851,6 +879,7 @@ export const createLangfuseClient = (input: {
       tracedGenerationIds: new Set<string>(),
       tracedEventIds: new Set<string>(),
       tracedReasoningIds: new Set<string>(),
+      toolCallMessageIds: new Map<string, string>(),
       pendingReasoningPartsByMessageId: new Map<
         string,
         CompletedReasoningPart[]
