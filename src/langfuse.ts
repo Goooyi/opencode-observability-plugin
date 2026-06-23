@@ -1,7 +1,16 @@
 import { LangfuseSpanProcessor } from "@langfuse/otel";
 import type { Hooks } from "@opencode-ai/plugin";
-import { SpanStatusCode, context, trace } from "@opentelemetry/api";
-import type { Span as ApiSpan, Tracer } from "@opentelemetry/api";
+import {
+  SpanStatusCode,
+  context,
+  propagation,
+  trace,
+} from "@opentelemetry/api";
+import type {
+  Context as ApiContext,
+  Span as ApiSpan,
+  Tracer,
+} from "@opentelemetry/api";
 import { NodeSDK } from "@opentelemetry/sdk-node";
 import type {
   ReadableSpan,
@@ -31,17 +40,15 @@ export class LangfuseClient {
   }
 
   clearTraceState() {
-    this.traceState.assistantParts.clear();
-    this.traceState.toolCallMessageIds.clear();
+    this.traceState.tracedMessageIds.clear();
+    this.traceState.tracedGenerationIds.clear();
     this.traceState.tracedEventIds.clear();
     this.traceState.tracedReasoningIds.clear();
-    this.traceState.pendingReasoningPartsByMessageId.clear();
-    this.traceState.generationSpanStarts.clear();
-    this.traceState.generationSpansByMessageId.clear();
-    this.traceState.generationParentSpanStarts.clear();
-    this.traceState.generationParentSpans.clear();
+    this.traceState.textPartsByAssistantMessageId.clear();
+    this.traceState.generationSpansByAssistantMessageId.clear();
     this.traceState.turnObservationsByMessageId.clear();
     this.traceState.latestTurnObservationsBySession.clear();
+    this.traceState.activeToolObservations.clear();
   }
 
   endActiveToolObservations() {
@@ -53,11 +60,11 @@ export class LangfuseClient {
   }
 
   endActiveGenerationSteps() {
-    for (const step of this.traceState.activeGenerationSteps.values()) {
-      step.span.end();
+    for (const observation of this.traceState.generationSpansByAssistantMessageId.values()) {
+      observation.span.end();
     }
 
-    this.traceState.activeGenerationSteps.clear();
+    this.traceState.generationSpansByAssistantMessageId.clear();
   }
 
   endActiveTurnObservations() {
@@ -89,17 +96,15 @@ export class LangfuseClient {
 
     const startEvent = () => {
       const span = this.traceState.tracer.startSpan(input.name, {
-        attributes: {
+        attributes: compactAttributes({
           "langfuse.observation.type": "event",
           "session.id": input.sessionID,
-          ...(input.input === undefined
-            ? {}
-            : { "langfuse.observation.input": JSON.stringify(input.input) }),
-          ...(input.output === undefined
-            ? {}
-            : { "langfuse.observation.output": JSON.stringify(input.output) }),
-          "langfuse.observation.metadata": JSON.stringify(input.metadata),
-        },
+          "langfuse.observation.input":
+            input.input === undefined ? undefined : stringify(input.input),
+          "langfuse.observation.output":
+            input.output === undefined ? undefined : stringify(input.output),
+          "langfuse.observation.metadata": stringify(input.metadata),
+        }),
         startTime: new Date(input.timestamp),
       });
 
@@ -114,160 +119,7 @@ export class LangfuseClient {
       return;
     }
 
-    this.withObservationParent(input.sessionID, undefined, startEvent);
-  }
-
-  traceReasoning(input: {
-    reasoningID: string;
-    sessionID: string;
-    timestamp: number;
-    text: string;
-    messageID?: string;
-    source: string;
-    parentSpan?: ApiSpan;
-  }) {
-    if (!input.text.trim()) {
-      return;
-    }
-
-    const reasoningTraceKey = `${input.sessionID}:${input.reasoningID}`;
-
-    if (this.traceState.tracedReasoningIds.has(reasoningTraceKey)) {
-      return;
-    }
-
-    this.traceState.tracedReasoningIds.add(reasoningTraceKey);
-
-    const timestamp = this.normalizeChildTimestamp({
-      sessionID: input.sessionID,
-      messageID: input.messageID,
-      parentSpan: input.parentSpan,
-      timestamp: input.timestamp,
-      minimumOffsetMs: 10,
-    });
-
-    this.traceEvent({
-      id: `reasoning:${reasoningTraceKey}`,
-      sessionID: input.sessionID,
-      name: "opencode.generation.reasoning",
-      timestamp,
-      output: { text: input.text },
-      metadata: {
-        reasoningID: input.reasoningID,
-        messageID: input.messageID,
-        source: input.source,
-      },
-      parentSpan: input.parentSpan,
-    });
-  }
-
-  traceReasoningPart(part: MessagePart) {
-    if (!isCompletedReasoningPart(part)) {
-      return;
-    }
-
-    const generationSpan = this.traceState.generationSpansByMessageId.get(
-      part.messageID,
-    );
-
-    if (!generationSpan) {
-      const pending =
-        this.traceState.pendingReasoningPartsByMessageId.get(part.messageID) ??
-        [];
-      pending.push(part);
-      this.traceState.pendingReasoningPartsByMessageId.set(
-        part.messageID,
-        pending,
-      );
-      return;
-    }
-
-    this.traceReasoning({
-      reasoningID: part.id,
-      sessionID: part.sessionID,
-      timestamp: part.time.end,
-      text: part.text,
-      messageID:
-        typeof part.messageID === "string" ? part.messageID : undefined,
-      source: "message.part.updated",
-      parentSpan: generationSpan,
-    });
-  }
-
-  startActiveGenerationStep(input: {
-    sessionID: string;
-    agent: string;
-    model: NonNullable<ActiveGenerationStep["model"]>;
-    started: number;
-    snapshot?: string;
-  }) {
-    const existingStep = this.traceState.activeGenerationSteps.get(
-      input.sessionID,
-    );
-
-    if (existingStep && !existingStep.model) {
-      existingStep.span.setAttribute(
-        "langfuse.observation.model.name",
-        input.model.id,
-      );
-      existingStep.span.setAttribute(
-        "langfuse.observation.metadata",
-        JSON.stringify({
-          agent: input.agent,
-          providerID: input.model.providerID,
-          variant: input.model.variant,
-          snapshot: input.snapshot,
-        }),
-      );
-      this.traceState.activeGenerationSteps.set(input.sessionID, {
-        ...existingStep,
-        agent: input.agent,
-        model: input.model,
-        started: Math.min(existingStep.started ?? input.started, input.started),
-        snapshot: input.snapshot,
-      });
-
-      return;
-    }
-
-    existingStep?.span.end(new Date(input.started));
-
-    const startTime = Math.min(
-      input.started,
-      this.getEarliestPendingReasoningTimestampForSession(input.sessionID) ??
-        input.started,
-    );
-
-    this.withTurnParent(input.sessionID, undefined, () => {
-      const span = this.traceState.tracer.startSpan("opencode.generation", {
-        attributes: {
-          "langfuse.observation.type": "generation",
-          "session.id": input.sessionID,
-          "langfuse.observation.model.name": input.model.id,
-          "langfuse.observation.metadata": JSON.stringify({
-            agent: input.agent,
-            providerID: input.model.providerID,
-            variant: input.model.variant,
-            snapshot: input.snapshot,
-          }),
-        },
-        startTime: new Date(startTime),
-      });
-
-      this.traceState.activeGenerationSteps.set(input.sessionID, {
-        agent: input.agent,
-        model: input.model,
-        span,
-        started: startTime,
-        snapshot: input.snapshot,
-      });
-      this.traceState.generationParentSpans.set(input.sessionID, span);
-      this.traceState.generationParentSpanStarts.set(
-        input.sessionID,
-        startTime,
-      );
-      this.traceState.generationSpanStarts.set(span, startTime);
-    });
+    this.withTurnParent(input.sessionID, undefined, startEvent);
   }
 
   traceUserMessage(input: {
@@ -286,41 +138,7 @@ export class LangfuseClient {
 
     const formattedInput = {
       role: "user" as const,
-      parts: input.parts.map((part) => {
-        if (part.type === "text") {
-          return { type: part.type, text: part.text ?? "" };
-        }
-
-        if (part.type === "file") {
-          return {
-            type: part.type,
-            filename: part.filename,
-            url: part.url,
-          };
-        }
-
-        if (part.type === "agent") {
-          return { type: part.type, name: part.name };
-        }
-
-        if (part.type === "subtask") {
-          return {
-            type: part.type,
-            prompt: part.prompt,
-            agent: part.agent,
-          };
-        }
-
-        if (part.type === "tool") {
-          return {
-            type: part.type,
-            tool: part.tool,
-            title: "title" in part.state ? part.state.title : undefined,
-          };
-        }
-
-        return { type: part.type };
-      }),
+      parts: input.parts.map(formatMessagePart),
     };
 
     if (input.messageID) {
@@ -336,23 +154,21 @@ export class LangfuseClient {
       this.traceState.latestTurnObservationsBySession.delete(input.sessionID);
     }
 
-    this.traceState.generationParentSpans.delete(input.sessionID);
-    this.traceState.generationParentSpanStarts.delete(input.sessionID);
-
-    const span = this.traceState.tracer.startSpan("opencode.turn", {
-      attributes: {
-        "langfuse.observation.type": "span",
-        "langfuse.internal.is_app_root": true,
-        "session.id": input.sessionID,
-        "langfuse.observation.input": JSON.stringify(formattedInput),
-        "langfuse.observation.metadata": JSON.stringify({
-          messageID: input.messageID,
-          agent: input.agent,
-          providerID: input.model?.providerID,
-          modelID: input.model?.modelID,
+    const span = this.withRootParent(() =>
+      this.traceState.tracer.startSpan("opencode.turn", {
+        attributes: compactAttributes({
+          "langfuse.observation.type": "span",
+          "session.id": input.sessionID,
+          "langfuse.observation.input": stringify(formattedInput),
+          "langfuse.observation.metadata": stringify({
+            messageID: input.messageID,
+            agent: input.agent,
+            providerID: input.model?.providerID,
+            modelID: input.model?.modelID,
+          }),
         }),
-      },
-    });
+      }),
+    );
 
     const observation = {
       span,
@@ -374,458 +190,314 @@ export class LangfuseClient {
 
     context.with(trace.setSpan(context.active(), span), () => {
       const event = this.traceState.tracer.startSpan("opencode.message.user", {
-        attributes: {
+        attributes: compactAttributes({
           "langfuse.observation.type": "event",
           "session.id": input.sessionID,
-          "langfuse.observation.input": JSON.stringify(formattedInput),
-          "langfuse.observation.metadata": JSON.stringify({
+          "langfuse.observation.input": stringify(formattedInput),
+          "langfuse.observation.metadata": stringify({
             messageID: input.messageID,
             agent: input.agent,
             providerID: input.model?.providerID,
             modelID: input.model?.modelID,
           }),
-        },
+        }),
       });
 
       event.end();
     });
   }
 
-  rememberAssistantPart(part: MessagePart) {
-    if (!part.id || !part.messageID) {
-      return;
-    }
-
-    if (part.type === "tool" && part.callID) {
-      this.traceState.toolCallMessageIds.set(part.callID, part.messageID);
-    }
-
-    const parts =
-      this.traceState.assistantParts.get(part.messageID) ??
-      new Map<string, MessagePart>();
-
-    parts.set(part.id, part);
-    this.traceState.assistantParts.set(part.messageID, parts);
-  }
-
-  traceGeneration(input: {
+  startGenerationStep(input: {
     sessionID: string;
-    messageID: string;
-    parentID: string;
-    modelID: string;
-    providerID: string;
-    agent?: string;
-    mode: string;
-    created: number;
-    completed: number;
-    finish?: string;
-    cost: number;
-    tokens: {
-      total?: number;
-      input: number;
-      output: number;
-      reasoning: number;
-      cache: { read: number; write: number };
-    };
+    assistantMessageID: string;
+    agent: string;
+    model: NonNullable<ActiveGenerationStep["model"]>;
+    timestamp: number;
+    snapshot?: string;
   }) {
-    if (this.traceState.tracedGenerationIds.has(input.messageID)) {
-      return;
-    }
-
-    this.traceState.tracedGenerationIds.add(input.messageID);
-
-    const output = this.getAssistantText(input.messageID);
-    const step = this.traceState.activeGenerationSteps.get(input.sessionID);
-
-    if (step) {
-      step.span.setAttribute("langfuse.observation.model.name", input.modelID);
-      step.span.setAttribute(
-        "langfuse.observation.output",
-        JSON.stringify({
-          role: "assistant",
-          content: output,
-        }),
-      );
-      step.span.setAttribute(
-        "langfuse.observation.usage_details",
-        JSON.stringify({
-          input: input.tokens.input,
-          output: input.tokens.output,
-          reasoning: input.tokens.reasoning,
-          cache_read: input.tokens.cache.read,
-          cache_write: input.tokens.cache.write,
-          total:
-            input.tokens.total ??
-            input.tokens.input + input.tokens.output + input.tokens.reasoning,
-        }),
-      );
-      step.span.setAttribute(
-        "langfuse.observation.cost_details",
-        JSON.stringify({ total: input.cost }),
-      );
-      step.span.setAttribute(
-        "langfuse.observation.metadata",
-        JSON.stringify({
-          messageID: input.messageID,
-          parentID: input.parentID,
-          agent: input.agent,
-          providerID: input.providerID,
-          mode: input.mode,
-          finish: input.finish,
-          variant: step.model?.variant,
-          snapshot: step.snapshot,
-        }),
-      );
-
-      this.traceState.generationSpansByMessageId.set(
-        input.messageID,
-        step.span,
-      );
-      if (!this.traceState.generationSpanStarts.has(step.span)) {
-        this.traceState.generationSpanStarts.set(
-          step.span,
-          step.started ?? input.created,
-        );
-      }
-      this.flushPendingReasoning(input.messageID, step.span);
-      step.span.end(new Date(input.completed));
-      this.traceState.activeGenerationSteps.delete(input.sessionID);
-      this.traceState.generationParentSpans.delete(input.sessionID);
-      this.traceState.generationParentSpanStarts.delete(input.sessionID);
-
-      return;
-    }
-
-    const startTime = Math.min(
-      input.created,
-      this.getEarliestPendingReasoningTimestampForMessage(input.messageID) ??
-        input.created,
+    const existing = this.traceState.generationSpansByAssistantMessageId.get(
+      input.assistantMessageID,
     );
-
-    this.withTurnParent(input.sessionID, input.parentID, () => {
-      const span = this.traceState.tracer.startSpan("opencode.generation", {
-        attributes: {
-          "langfuse.observation.type": "generation",
-          "session.id": input.sessionID,
-          "langfuse.observation.model.name": input.modelID,
-          "langfuse.observation.output": JSON.stringify({
-            role: "assistant",
-            content: output,
-          }),
-          "langfuse.observation.usage_details": JSON.stringify({
-            input: input.tokens.input,
-            output: input.tokens.output,
-            reasoning: input.tokens.reasoning,
-            cache_read: input.tokens.cache.read,
-            cache_write: input.tokens.cache.write,
-            total:
-              input.tokens.total ??
-              input.tokens.input + input.tokens.output + input.tokens.reasoning,
-          }),
-          "langfuse.observation.cost_details": JSON.stringify({
-            total: input.cost,
-          }),
-          "langfuse.observation.metadata": JSON.stringify({
-            messageID: input.messageID,
-            parentID: input.parentID,
-            agent: input.agent,
-            providerID: input.providerID,
-            mode: input.mode,
-            finish: input.finish,
-          }),
-        },
-        startTime: new Date(startTime),
-      });
-
-      this.traceState.generationParentSpans.set(input.sessionID, span);
-      this.traceState.generationParentSpanStarts.set(
-        input.sessionID,
-        startTime,
-      );
-      this.traceState.generationSpanStarts.set(span, startTime);
-      this.traceState.generationSpansByMessageId.set(input.messageID, span);
-      this.flushPendingReasoning(input.messageID, span);
-      span.end(new Date(input.completed));
-      this.traceState.generationParentSpans.delete(input.sessionID);
-      this.traceState.generationParentSpanStarts.delete(input.sessionID);
-    });
-  }
-
-  private flushPendingReasoning(messageID: string, parentSpan: ApiSpan) {
-    const pending =
-      this.traceState.pendingReasoningPartsByMessageId.get(messageID) ?? [];
-    this.traceState.pendingReasoningPartsByMessageId.delete(messageID);
-
-    for (const part of pending) {
-      this.traceReasoning({
-        reasoningID: part.id,
-        sessionID: part.sessionID,
-        timestamp: part.time.end,
-        text: part.text,
-        messageID: part.messageID,
-        source: "message.part.updated",
-        parentSpan,
-      });
-    }
-  }
-
-  private getEarliestPendingReasoningTimestampForMessage(messageID: string) {
-    const pending =
-      this.traceState.pendingReasoningPartsByMessageId.get(messageID) ?? [];
-    return minReasoningTimestamp(pending);
-  }
-
-  private getEarliestPendingReasoningTimestampForSession(sessionID: string) {
-    let earliest: number | undefined;
-
-    for (const pending of this.traceState.pendingReasoningPartsByMessageId.values()) {
-      for (const part of pending) {
-        if (part.sessionID !== sessionID) {
-          continue;
-        }
-
-        earliest = Math.min(earliest ?? part.time.end, part.time.end);
-      }
-    }
-
-    return earliest;
-  }
-
-  traceFailedGenerationStep(input: {
-    id: string;
-    sessionID: string;
-    completed: number;
-    error: { message: string };
-  }) {
-    if (this.traceState.tracedGenerationIds.has(input.id)) {
-      return;
-    }
-
-    this.traceState.tracedGenerationIds.add(input.id);
-
-    const step = this.traceState.activeGenerationSteps.get(input.sessionID);
-
-    if (step) {
-      step.span.setAttribute(
-        "langfuse.observation.output",
-        JSON.stringify({ error: input.error }),
-      );
-      step.span.setAttribute(
-        "langfuse.observation.metadata",
-        JSON.stringify({
-          agent: step.agent,
-          providerID: step.model?.providerID,
-          variant: step.model?.variant,
-          snapshot: step.snapshot,
-        }),
-      );
-      step.span.setStatus({
-        code: SpanStatusCode.ERROR,
-        message: input.error.message,
-      });
-      step.span.recordException(input.error);
-      step.span.end(new Date(input.completed));
-      this.traceState.activeGenerationSteps.delete(input.sessionID);
-      this.traceState.generationParentSpans.delete(input.sessionID);
-      this.traceState.generationParentSpanStarts.delete(input.sessionID);
-
-      return;
-    }
+    existing?.span.end(new Date(input.timestamp));
 
     this.withTurnParent(input.sessionID, undefined, () => {
-      const span = this.traceState.tracer.startSpan(
-        "opencode.generation.failed",
+      const span = this.traceState.tracer.startSpan("opencode.generation", {
+        attributes: compactAttributes({
+          "langfuse.observation.type": "generation",
+          "session.id": input.sessionID,
+          "langfuse.observation.model.name": input.model.id,
+          "langfuse.observation.metadata": stringify({
+            assistantMessageID: input.assistantMessageID,
+            agent: input.agent,
+            providerID: input.model.providerID,
+            variant: input.model.variant,
+            snapshot: input.snapshot,
+          }),
+        }),
+        startTime: new Date(input.timestamp),
+      });
+
+      this.traceState.generationSpansByAssistantMessageId.set(
+        input.assistantMessageID,
         {
-          attributes: {
-            "langfuse.observation.type": "generation",
-            "session.id": input.sessionID,
-            "langfuse.observation.output": JSON.stringify({
-              error: input.error,
-            }),
-          },
-          startTime: new Date(input.completed),
+          agent: input.agent,
+          assistantMessageID: input.assistantMessageID,
+          model: input.model,
+          sessionID: input.sessionID,
+          snapshot: input.snapshot,
+          span,
         },
       );
-
-      span.setStatus({
-        code: SpanStatusCode.ERROR,
-        message: input.error.message,
-      });
-      span.recordException(input.error);
-      this.traceState.generationParentSpans.set(input.sessionID, span);
-      this.traceState.generationParentSpanStarts.set(
-        input.sessionID,
-        input.completed,
-      );
-      this.traceState.generationSpanStarts.set(span, input.completed);
-      span.end(new Date(input.completed));
-      this.traceState.generationParentSpans.delete(input.sessionID);
-      this.traceState.generationParentSpanStarts.delete(input.sessionID);
     });
   }
 
-  traceToolStart(input: {
+  recordAssistantText(input: {
+    assistantMessageID: string;
+    textID: string;
+    text: string;
+  }) {
+    const parts =
+      this.traceState.textPartsByAssistantMessageId.get(
+        input.assistantMessageID,
+      ) ?? new Map<string, string>();
+    parts.set(input.textID, input.text);
+    this.traceState.textPartsByAssistantMessageId.set(
+      input.assistantMessageID,
+      parts,
+    );
+  }
+
+  traceReasoning(input: {
+    assistantMessageID: string;
+    reasoningID: string;
     sessionID: string;
+    timestamp: number;
+    text: string;
+    providerMetadata?: unknown;
+  }) {
+    if (!input.text.trim()) return;
+
+    const reasoningTraceKey = `${input.assistantMessageID}:${input.reasoningID}`;
+    if (this.traceState.tracedReasoningIds.has(reasoningTraceKey)) return;
+    this.traceState.tracedReasoningIds.add(reasoningTraceKey);
+
+    this.traceEvent({
+      id: `reasoning:${reasoningTraceKey}`,
+      sessionID: input.sessionID,
+      name: "opencode.generation.reasoning",
+      timestamp: input.timestamp,
+      output: { text: input.text },
+      metadata: {
+        assistantMessageID: input.assistantMessageID,
+        reasoningID: input.reasoningID,
+        providerMetadata: input.providerMetadata,
+        source: "session.next.reasoning.ended",
+      },
+      parentSpan: this.traceState.generationSpansByAssistantMessageId.get(
+        input.assistantMessageID,
+      )?.span,
+    });
+  }
+
+  finishGenerationStep(input: {
+    sessionID: string;
+    assistantMessageID: string;
+    timestamp: number;
+    finish: string;
+    cost: number;
+    tokens: TokenUsage;
+    snapshot?: string;
+  }) {
+    if (this.traceState.tracedGenerationIds.has(input.assistantMessageID)) {
+      return;
+    }
+
+    this.traceState.tracedGenerationIds.add(input.assistantMessageID);
+
+    const observation = this.traceState.generationSpansByAssistantMessageId.get(
+      input.assistantMessageID,
+    );
+    if (!observation) return;
+
+    observation.span.setAttribute(
+      "langfuse.observation.output",
+      stringify({
+        role: "assistant",
+        content: this.getAssistantText(input.assistantMessageID),
+      }),
+    );
+    observation.span.setAttribute(
+      "langfuse.observation.usage_details",
+      stringify({
+        input: input.tokens.input,
+        output: input.tokens.output,
+        reasoning: input.tokens.reasoning,
+        cache_read: input.tokens.cache?.read ?? 0,
+        cache_write: input.tokens.cache?.write ?? 0,
+        total:
+          input.tokens.input + input.tokens.output + input.tokens.reasoning,
+      }),
+    );
+    observation.span.setAttribute(
+      "langfuse.observation.cost_details",
+      stringify({ total: input.cost }),
+    );
+    observation.span.setAttribute(
+      "langfuse.observation.metadata",
+      stringify({
+        assistantMessageID: input.assistantMessageID,
+        agent: observation.agent,
+        providerID: observation.model?.providerID,
+        variant: observation.model?.variant,
+        snapshot: input.snapshot ?? observation.snapshot,
+        finish: input.finish,
+      }),
+    );
+    observation.span.end(new Date(input.timestamp));
+    this.traceState.generationSpansByAssistantMessageId.delete(
+      input.assistantMessageID,
+    );
+  }
+
+  failGenerationStep(input: {
+    sessionID: string;
+    assistantMessageID: string;
+    timestamp: number;
+    error: { message: string };
+  }) {
+    if (this.traceState.tracedGenerationIds.has(input.assistantMessageID)) {
+      return;
+    }
+
+    this.traceState.tracedGenerationIds.add(input.assistantMessageID);
+
+    const observation = this.traceState.generationSpansByAssistantMessageId.get(
+      input.assistantMessageID,
+    );
+
+    if (!observation) return;
+
+    observation.span.setAttribute(
+      "langfuse.observation.output",
+      stringify({ error: input.error }),
+    );
+    observation.span.setStatus({
+      code: SpanStatusCode.ERROR,
+      message: input.error.message,
+    });
+    observation.span.recordException(input.error);
+    observation.span.end(new Date(input.timestamp));
+    this.traceState.generationSpansByAssistantMessageId.delete(
+      input.assistantMessageID,
+    );
+  }
+
+  traceToolCalled(input: {
+    sessionID: string;
+    assistantMessageID: string;
     callID: string;
     tool: string;
     args: unknown;
-    messageID?: string;
+    timestamp: number;
+    provider?: unknown;
   }) {
     this.traceState.activeToolObservations.get(input.callID)?.span.end();
-    const messageID =
-      input.messageID ?? this.traceState.toolCallMessageIds.get(input.callID);
-    this.ensureGenerationParent(input.sessionID, messageID);
 
-    this.withObservationParent(input.sessionID, messageID, () => {
+    const parent = this.traceState.generationSpansByAssistantMessageId.get(
+      input.assistantMessageID,
+    )?.span;
+
+    const start = () => {
       const span = this.traceState.tracer.startSpan(input.tool, {
-        attributes: {
+        attributes: compactAttributes({
           "langfuse.observation.type": "tool",
           "session.id": input.sessionID,
-          "langfuse.observation.input": JSON.stringify(input.args),
-          "langfuse.observation.metadata": JSON.stringify({
+          "langfuse.observation.input": stringify(input.args),
+          "langfuse.observation.metadata": stringify({
+            assistantMessageID: input.assistantMessageID,
             callID: input.callID,
+            provider: input.provider,
             tool: input.tool,
-            messageID,
           }),
-        },
+        }),
+        startTime: new Date(input.timestamp),
       });
 
       this.traceState.activeToolObservations.set(input.callID, {
-        span,
+        assistantMessageID: input.assistantMessageID,
+        args: input.args,
         sessionID: input.sessionID,
+        span,
         tool: input.tool,
       });
-    });
+    };
+
+    parent
+      ? context.with(trace.setSpan(context.active(), parent), start)
+      : this.withRootParent(start);
   }
 
-  traceToolEnd(input: {
-    sessionID: string;
+  traceToolSuccess(input: {
     callID: string;
-    tool: string;
-    args: unknown;
-    title: string;
-    output: string;
-    messageID?: string;
+    timestamp: number;
+    output: unknown;
+    provider?: unknown;
   }) {
-    if (!this.traceState.activeToolObservations.has(input.callID)) {
-      this.traceToolStart({
-        sessionID: input.sessionID,
-        callID: input.callID,
-        tool: input.tool,
-        args: input.args,
-        messageID: input.messageID,
-      });
-    }
+    this.endTool(input.callID, input.timestamp, input.output, input.provider);
+  }
 
-    const span = this.traceState.activeToolObservations.get(input.callID)?.span;
-
-    if (!span) {
-      return;
-    }
-
-    span.setAttribute(
-      "langfuse.observation.output",
-      JSON.stringify({ title: input.title, output: input.output }),
+  traceToolFailed(input: {
+    callID: string;
+    timestamp: number;
+    error: unknown;
+    result?: unknown;
+    provider?: unknown;
+  }) {
+    this.endTool(
+      input.callID,
+      input.timestamp,
+      { error: input.error, result: input.result },
+      input.provider,
+      input.error,
     );
-    span.setAttribute(
+  }
+
+  private endTool(
+    callID: string,
+    timestamp: number,
+    output: unknown,
+    provider?: unknown,
+    error?: unknown,
+  ) {
+    const observation = this.traceState.activeToolObservations.get(callID);
+    if (!observation) return;
+
+    observation.span.setAttribute(
+      "langfuse.observation.output",
+      stringify(output),
+    );
+    observation.span.setAttribute(
       "langfuse.observation.metadata",
-      JSON.stringify({
-        callID: input.callID,
-        tool: input.tool,
-        messageID:
-          input.messageID ??
-          this.traceState.toolCallMessageIds.get(input.callID),
+      stringify({
+        assistantMessageID: observation.assistantMessageID,
+        callID,
+        provider,
+        tool: observation.tool,
       }),
     );
 
-    span.end();
-    this.traceState.activeToolObservations.delete(input.callID);
-  }
-
-  private ensureGenerationParent(sessionID: string, messageID?: string) {
-    if (
-      (messageID &&
-        this.traceState.generationSpansByMessageId.has(messageID)) ||
-      this.traceState.activeGenerationSteps.has(sessionID) ||
-      this.traceState.generationParentSpans.has(sessionID)
-    ) {
-      return;
-    }
-
-    const started = Date.now();
-
-    this.withTurnParent(sessionID, undefined, () => {
-      const span = this.traceState.tracer.startSpan("opencode.generation", {
-        attributes: {
-          "langfuse.observation.type": "generation",
-          "session.id": sessionID,
-        },
+    if (error) {
+      const exception =
+        error instanceof Error ? error : new Error(stringify(error));
+      observation.span.setStatus({
+        code: SpanStatusCode.ERROR,
+        message: exception.message,
       });
-
-      this.traceState.activeGenerationSteps.set(sessionID, { span });
-      this.traceState.generationParentSpans.set(sessionID, span);
-      this.traceState.generationParentSpanStarts.set(sessionID, started);
-      this.traceState.generationSpanStarts.set(span, started);
-    });
-  }
-
-  private normalizeChildTimestamp(input: {
-    sessionID: string;
-    messageID?: string;
-    parentSpan?: ApiSpan;
-    timestamp: number;
-    minimumOffsetMs?: number;
-  }) {
-    const parentStart = this.getCurrentGenerationStart(input);
-    if (parentStart === undefined) {
-      return input.timestamp;
+      observation.span.recordException(exception);
     }
 
-    return Math.max(
-      input.timestamp,
-      parentStart + (input.minimumOffsetMs ?? 0),
-    );
-  }
-
-  private getCurrentGenerationStart(input: {
-    sessionID: string;
-    messageID?: string;
-    parentSpan?: ApiSpan;
-  }) {
-    if (input.parentSpan) {
-      const parentSpanStart = this.traceState.generationSpanStarts.get(
-        input.parentSpan,
-      );
-      if (parentSpanStart !== undefined) {
-        return parentSpanStart;
-      }
-    }
-
-    if (input.messageID) {
-      const messageSpan = this.traceState.generationSpansByMessageId.get(
-        input.messageID,
-      );
-      if (messageSpan) {
-        const messageSpanStart =
-          this.traceState.generationSpanStarts.get(messageSpan);
-        if (messageSpanStart !== undefined) {
-          return messageSpanStart;
-        }
-      }
-    }
-
-    const activeStep = this.traceState.activeGenerationSteps.get(
-      input.sessionID,
-    );
-    if (activeStep?.started !== undefined) {
-      return activeStep.started;
-    }
-
-    if (this.traceState.generationParentSpans.has(input.sessionID)) {
-      return this.traceState.generationParentSpanStarts.get(input.sessionID);
-    }
-
-    return undefined;
+    observation.span.end(new Date(timestamp));
+    this.traceState.activeToolObservations.delete(callID);
   }
 
   private withTurnParent<T>(
@@ -841,90 +513,42 @@ export class LangfuseClient {
 
     return parentSpan
       ? context.with(trace.setSpan(context.active(), parentSpan), fn)
-      : fn();
+      : this.withRootParent(fn);
   }
 
-  private withObservationParent<T>(
-    sessionID: string,
-    messageID: string | undefined,
-    fn: () => T,
-  ) {
-    const parentSpan =
-      (messageID
-        ? this.traceState.generationSpansByMessageId.get(messageID)
-        : undefined) ??
-      this.traceState.activeGenerationSteps.get(sessionID)?.span ??
-      this.traceState.generationParentSpans.get(sessionID);
-
-    return parentSpan
-      ? context.with(trace.setSpan(context.active(), parentSpan), fn)
-      : fn();
+  private withRootParent<T>(fn: () => T) {
+    return context.with(this.traceState.rootContext, fn);
   }
 
-  private getAssistantText(messageID: string) {
+  private getAssistantText(assistantMessageID: string) {
     return Array.from(
-      this.traceState.assistantParts.get(messageID)?.values() ?? [],
-    )
-      .filter(
-        (part): part is Extract<MessagePart, { type: "text" }> =>
-          part.type === "text" && Boolean(part.text),
-      )
-      .map((part) => part.text)
-      .join("");
+      this.traceState.textPartsByAssistantMessageId
+        .get(assistantMessageID)
+        ?.values() ?? [],
+    ).join("");
   }
 }
 
 export type LangfuseTraceState = {
   tracerName: string;
   tracer: Tracer;
+  rootContext: ApiContext;
+  hasExternalTraceParent: boolean;
   tracedMessageIds: Set<string>;
   tracedGenerationIds: Set<string>;
   tracedEventIds: Set<string>;
   tracedReasoningIds: Set<string>;
-  toolCallMessageIds: Map<string, string>;
-  pendingReasoningPartsByMessageId: Map<string, CompletedReasoningPart[]>;
-  generationSpanStarts: Map<ApiSpan, number>;
-  generationSpansByMessageId: Map<string, ApiSpan>;
-  assistantParts: Map<string, Map<string, MessagePart>>;
+  textPartsByAssistantMessageId: Map<string, Map<string, string>>;
+  generationSpansByAssistantMessageId: Map<string, ActiveGenerationStep>;
   turnObservationsByMessageId: Map<string, TurnObservation>;
   latestTurnObservationsBySession: Map<string, TurnObservation>;
   activeToolObservations: Map<string, ToolObservation>;
-  activeGenerationSteps: Map<string, ActiveGenerationStep>;
-  generationParentSpanStarts: Map<string, number>;
-  generationParentSpans: Map<string, ApiSpan>;
 };
 
 export type MessagePart = Extract<
   Parameters<NonNullable<Hooks["event"]>>[0]["event"],
   { type: "message.part.updated" }
 >["properties"]["part"];
-
-type CompletedReasoningPart = MessagePart & {
-  id: string;
-  sessionID: string;
-  text: string;
-  messageID?: string;
-  time: { end: number };
-};
-
-function isCompletedReasoningPart(
-  part: MessagePart,
-): part is CompletedReasoningPart {
-  return (
-    part.type === "reasoning" &&
-    typeof part.id === "string" &&
-    typeof part.sessionID === "string" &&
-    typeof part.text === "string" &&
-    typeof (part as { time?: { end?: unknown } }).time?.end === "number"
-  );
-}
-
-function minReasoningTimestamp(parts: CompletedReasoningPart[]) {
-  return parts.reduce<number | undefined>(
-    (earliest, part) => Math.min(earliest ?? part.time.end, part.time.end),
-    undefined,
-  );
-}
 
 export type FormattedMessagePart =
   | { type: string; text: string }
@@ -934,11 +558,6 @@ export type FormattedMessagePart =
   | { type: string; tool?: string; title?: string }
   | { type: string };
 
-export type UserMessageInput = {
-  role: "user";
-  parts: FormattedMessagePart[];
-};
-
 export type TurnObservation = {
   span: ApiSpan;
   sessionID: string;
@@ -946,21 +565,31 @@ export type TurnObservation = {
 };
 
 export type ToolObservation = {
+  assistantMessageID: string;
+  args: unknown;
   span: ApiSpan;
   sessionID: string;
   tool: string;
 };
 
+export type TokenUsage = {
+  input: number;
+  output: number;
+  reasoning: number;
+  cache?: { read: number; write: number };
+};
+
 export type ActiveGenerationStep = {
   agent?: string;
+  assistantMessageID: string;
   model?: {
     id: string;
     providerID: string;
     variant?: string;
   };
-  span: ApiSpan;
-  started?: number;
+  sessionID: string;
   snapshot?: string;
+  span: ApiSpan;
 };
 
 export class LangfuseClientService extends EffectContext.Tag(
@@ -987,17 +616,16 @@ const makePluginVersionSpanProcessor = () =>
     forceFlush: () => Promise.resolve(),
   }) satisfies SpanProcessor;
 
-// Langfuse's OTEL processor may auto-mark exported spans as app roots, this overrides that.
-const makeAppRootSpanProcessor = (tracerName: string) =>
+const makeAppRootSpanProcessor = (
+  tracerName: string,
+  hasExternalTraceParent: boolean,
+) =>
   ({
     onStart: (span: Span, _parentContext: unknown) => {
-      if (span.instrumentationScope.name !== tracerName) {
-        return;
-      }
-
+      if (span.instrumentationScope.name !== tracerName) return;
       span.setAttribute(
         "langfuse.internal.is_app_root",
-        span.name === "opencode.turn",
+        !hasExternalTraceParent && span.name === "opencode.turn",
       );
     },
     onEnd: (_span: ReadableSpan) => {},
@@ -1014,27 +642,25 @@ export const createLangfuseClient = (input: {
 }) =>
   Effect.gen(function* () {
     const tracerName = "opencode-langfuse-plugin";
+    const traceparent =
+      process.env.OPENCODE_TRACEPARENT ?? process.env.TRACEPARENT;
     const traceState: LangfuseTraceState = {
       tracerName,
       tracer: trace.getTracer(tracerName, PLUGIN_VERSION),
+      rootContext: context.active(),
+      hasExternalTraceParent: Boolean(traceparent),
       tracedMessageIds: new Set<string>(),
       tracedGenerationIds: new Set<string>(),
       tracedEventIds: new Set<string>(),
       tracedReasoningIds: new Set<string>(),
-      toolCallMessageIds: new Map<string, string>(),
-      pendingReasoningPartsByMessageId: new Map<
+      textPartsByAssistantMessageId: new Map<string, Map<string, string>>(),
+      generationSpansByAssistantMessageId: new Map<
         string,
-        CompletedReasoningPart[]
+        ActiveGenerationStep
       >(),
-      generationSpanStarts: new Map<ApiSpan, number>(),
-      generationSpansByMessageId: new Map<string, ApiSpan>(),
-      assistantParts: new Map<string, Map<string, MessagePart>>(),
       turnObservationsByMessageId: new Map<string, TurnObservation>(),
       latestTurnObservationsBySession: new Map<string, TurnObservation>(),
       activeToolObservations: new Map<string, ToolObservation>(),
-      activeGenerationSteps: new Map<string, ActiveGenerationStep>(),
-      generationParentSpanStarts: new Map<string, number>(),
-      generationParentSpans: new Map<string, ApiSpan>(),
     };
 
     const processor = new LangfuseSpanProcessor({
@@ -1051,29 +677,56 @@ export const createLangfuseClient = (input: {
         makePluginVersionSpanProcessor(),
         ...(input.userId ? [makeUserIdSpanProcessor(input.userId)] : []),
         processor,
-        makeAppRootSpanProcessor(traceState.tracerName),
+        makeAppRootSpanProcessor(
+          traceState.tracerName,
+          traceState.hasExternalTraceParent,
+        ),
       ],
     });
     let isShutdown = false;
 
     yield* Effect.sync(() => sdk.start());
+    traceState.rootContext = traceparent
+      ? propagation.extract(context.active(), { traceparent })
+      : context.active();
 
     return new LangfuseClient({
       baseUrl: input.baseUrl,
       traceState,
-      forceFlush: Effect.tryPromise(() =>
-        isShutdown ? Promise.resolve() : processor.forceFlush(),
-      ),
-      shutdown: Effect.gen(function* () {
-        if (isShutdown) {
-          return;
-        }
-
+      forceFlush: Effect.tryPromise(() => processor.forceFlush()),
+      shutdown: Effect.tryPromise(async () => {
+        if (isShutdown) return;
         isShutdown = true;
-        yield* Effect.tryPromise(() => processor.forceFlush()).pipe(
-          Effect.catchAll(() => Effect.void),
-        );
-        yield* Effect.tryPromise(() => sdk.shutdown());
+        await sdk.shutdown();
       }),
     });
   });
+
+function formatMessagePart(part: MessagePart): FormattedMessagePart {
+  if (part.type === "text") return { type: part.type, text: part.text ?? "" };
+  if (part.type === "file")
+    return { type: part.type, filename: part.filename, url: part.url };
+  if (part.type === "agent") return { type: part.type, name: part.name };
+  if (part.type === "subtask")
+    return { type: part.type, prompt: part.prompt, agent: part.agent };
+  if (part.type === "tool") {
+    return {
+      type: part.type,
+      tool: part.tool,
+      title: "title" in part.state ? part.state.title : undefined,
+    };
+  }
+  return { type: part.type };
+}
+
+function stringify(input: unknown) {
+  return JSON.stringify(input);
+}
+
+function compactAttributes(
+  input: Record<string, string | number | boolean | undefined>,
+) {
+  return Object.fromEntries(
+    Object.entries(input).filter(([, value]) => value !== undefined),
+  );
+}

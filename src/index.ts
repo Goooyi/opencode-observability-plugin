@@ -9,6 +9,7 @@ import {
   LangfuseClientService,
   createLangfuseClient,
   type ActiveGenerationStep,
+  type TokenUsage,
 } from "./langfuse.js";
 import { OpencodeClientService } from "./opencode.js";
 import { log } from "./utils.js";
@@ -22,6 +23,7 @@ type SessionNextEvent =
       properties: {
         sessionID: string;
         timestamp: number;
+        assistantMessageID: string;
         agent: string;
         model: NonNullable<ActiveGenerationStep["model"]>;
         snapshot?: string;
@@ -30,7 +32,15 @@ type SessionNextEvent =
   | {
       id: string;
       type: "session.next.step.ended";
-      properties: { sessionID: string; timestamp: number };
+      properties: {
+        sessionID: string;
+        timestamp: number;
+        assistantMessageID: string;
+        finish: string;
+        cost: number;
+        tokens: TokenUsage;
+        snapshot?: string;
+      };
     }
   | {
       id: string;
@@ -38,7 +48,19 @@ type SessionNextEvent =
       properties: {
         sessionID: string;
         timestamp: number;
+        assistantMessageID: string;
         error: { message: string };
+      };
+    }
+  | {
+      id: string;
+      type: "session.next.text.ended";
+      properties: {
+        sessionID: string;
+        timestamp: number;
+        assistantMessageID: string;
+        textID: string;
+        text: string;
       };
     }
   | {
@@ -57,8 +79,51 @@ type SessionNextEvent =
       properties: {
         sessionID: string;
         timestamp: number;
+        assistantMessageID: string;
         reasoningID: string;
         text: string;
+        providerMetadata?: unknown;
+      };
+    }
+  | {
+      id: string;
+      type: "session.next.tool.called";
+      properties: {
+        sessionID: string;
+        timestamp: number;
+        assistantMessageID: string;
+        callID: string;
+        tool: string;
+        input: Record<string, unknown>;
+        provider?: unknown;
+      };
+    }
+  | {
+      id: string;
+      type: "session.next.tool.success";
+      properties: {
+        sessionID: string;
+        timestamp: number;
+        assistantMessageID: string;
+        callID: string;
+        structured: Record<string, unknown>;
+        content: unknown[];
+        outputPaths?: string[];
+        result?: unknown;
+        provider?: unknown;
+      };
+    }
+  | {
+      id: string;
+      type: "session.next.tool.failed";
+      properties: {
+        sessionID: string;
+        timestamp: number;
+        assistantMessageID: string;
+        callID: string;
+        error: unknown;
+        result?: unknown;
+        provider?: unknown;
       };
     }
   | {
@@ -149,27 +214,43 @@ const eventHook = (event: OpencodeEvent) =>
       yield* langfuse.shutdown;
     }
 
-    if (event.type === "message.part.updated") {
-      langfuse.rememberAssistantPart(event.properties.part);
-      langfuse.traceReasoningPart(event.properties.part);
-    }
-
     if (event.type === "session.next.step.started") {
-      langfuse.startActiveGenerationStep({
+      langfuse.startGenerationStep({
         sessionID: event.properties.sessionID,
+        assistantMessageID: event.properties.assistantMessageID,
         agent: event.properties.agent,
         model: event.properties.model,
-        started: event.properties.timestamp,
+        timestamp: event.properties.timestamp,
+        snapshot: event.properties.snapshot,
+      });
+    }
+
+    if (event.type === "session.next.step.ended") {
+      langfuse.finishGenerationStep({
+        sessionID: event.properties.sessionID,
+        assistantMessageID: event.properties.assistantMessageID,
+        timestamp: event.properties.timestamp,
+        finish: event.properties.finish,
+        cost: event.properties.cost,
+        tokens: event.properties.tokens,
         snapshot: event.properties.snapshot,
       });
     }
 
     if (event.type === "session.next.step.failed") {
-      langfuse.traceFailedGenerationStep({
-        id: event.id,
+      langfuse.failGenerationStep({
         sessionID: event.properties.sessionID,
-        completed: event.properties.timestamp,
+        assistantMessageID: event.properties.assistantMessageID,
+        timestamp: event.properties.timestamp,
         error: event.properties.error,
+      });
+    }
+
+    if (event.type === "session.next.text.ended") {
+      langfuse.recordAssistantText({
+        assistantMessageID: event.properties.assistantMessageID,
+        textID: event.properties.textID,
+        text: event.properties.text,
       });
     }
 
@@ -188,11 +269,48 @@ const eventHook = (event: OpencodeEvent) =>
 
     if (event.type === "session.next.reasoning.ended") {
       langfuse.traceReasoning({
+        assistantMessageID: event.properties.assistantMessageID,
         reasoningID: event.properties.reasoningID,
         sessionID: event.properties.sessionID,
         timestamp: event.properties.timestamp,
         text: event.properties.text,
-        source: "session.next.reasoning.ended",
+        providerMetadata: event.properties.providerMetadata,
+      });
+    }
+
+    if (event.type === "session.next.tool.called") {
+      langfuse.traceToolCalled({
+        sessionID: event.properties.sessionID,
+        assistantMessageID: event.properties.assistantMessageID,
+        callID: event.properties.callID,
+        tool: event.properties.tool,
+        args: event.properties.input,
+        timestamp: event.properties.timestamp,
+        provider: event.properties.provider,
+      });
+    }
+
+    if (event.type === "session.next.tool.success") {
+      langfuse.traceToolSuccess({
+        callID: event.properties.callID,
+        timestamp: event.properties.timestamp,
+        output: {
+          structured: event.properties.structured,
+          content: event.properties.content,
+          outputPaths: event.properties.outputPaths,
+          result: event.properties.result,
+        },
+        provider: event.properties.provider,
+      });
+    }
+
+    if (event.type === "session.next.tool.failed") {
+      langfuse.traceToolFailed({
+        callID: event.properties.callID,
+        timestamp: event.properties.timestamp,
+        error: event.properties.error,
+        result: event.properties.result,
+        provider: event.properties.provider,
       });
     }
 
@@ -206,29 +324,6 @@ const eventHook = (event: OpencodeEvent) =>
         metadata: {
           include: event.properties.include,
         },
-      });
-    }
-
-    if (event.type === "message.updated") {
-      const message = event.properties.info;
-
-      if (message.role !== "assistant" || !message.time.completed) {
-        return;
-      }
-
-      langfuse.traceGeneration({
-        sessionID: message.sessionID,
-        messageID: message.id,
-        parentID: message.parentID,
-        modelID: message.modelID,
-        providerID: message.providerID,
-        agent: message.mode,
-        mode: message.mode,
-        created: message.time.created,
-        completed: message.time.completed,
-        finish: message.finish,
-        cost: message.cost,
-        tokens: message.tokens,
       });
     }
   });
@@ -315,24 +410,44 @@ const main = Effect.gen(function* () {
       ),
     );
 
+  let hookQueue = Promise.resolve();
+  const enqueueHook = (
+    hookName: string,
+    effect: Effect.Effect<
+      unknown,
+      unknown,
+      OpencodeClientService | LangfuseClientService
+    >,
+  ) => {
+    hookQueue = hookQueue.then(
+      () => runHook(hookName, effect),
+      () => runHook(hookName, effect),
+    );
+    return hookQueue;
+  };
+
   const hooks: Hooks = {
-    config: (config) =>
-      runHook(
-        "config",
+    dispose: async () => {
+      await hookQueue.catch(() => undefined);
+      await runHook(
+        "dispose",
         Effect.gen(function* () {
-          if (!config.experimental?.openTelemetry) {
-            yield* log(
-              "warn",
-              "[Tracing disabled] Please enable `experimental.openTelemetry` in your opencode.jsonc to use the Langfuse plugin",
-            );
-          }
+          langfuse.endActiveToolObservations();
+          langfuse.endActiveGenerationSteps();
+          langfuse.endActiveTurnObservations();
+          langfuse.clearTraceState();
+          yield* langfuse.shutdown;
         }),
-      ),
+      );
+    },
 
-    event: ({ event }) => runHook("event", eventHook(event)),
+    event: ({ event }) => {
+      void enqueueHook("event", eventHook(event));
+      return Promise.resolve();
+    },
 
-    "chat.message": (input, output) =>
-      runHook(
+    "chat.message": (input, output) => {
+      void enqueueHook(
         "chat.message",
         Effect.try({
           try: () =>
@@ -345,39 +460,9 @@ const main = Effect.gen(function* () {
             }),
           catch: (error) => error,
         }),
-      ),
-
-    "tool.execute.before": (input, output) =>
-      runHook(
-        "tool.execute.before",
-        Effect.try({
-          try: () =>
-            langfuse.traceToolStart({
-              sessionID: input.sessionID,
-              callID: input.callID,
-              tool: input.tool,
-              args: output.args,
-            }),
-          catch: (error) => error,
-        }),
-      ),
-
-    "tool.execute.after": (input, output) =>
-      runHook(
-        "tool.execute.after",
-        Effect.try({
-          try: () =>
-            langfuse.traceToolEnd({
-              sessionID: input.sessionID,
-              callID: input.callID,
-              tool: input.tool,
-              args: input.args,
-              title: output.title,
-              output: output.output,
-            }),
-          catch: (error) => error,
-        }),
-      ),
+      );
+      return Promise.resolve();
+    },
   };
 
   return hooks;
@@ -385,7 +470,6 @@ const main = Effect.gen(function* () {
 
 export const LangfusePlugin: Plugin = async ({ client }) => {
   const clientLayer = Layer.succeed(OpencodeClientService, client);
-
   return Effect.runPromise(main.pipe(Effect.provide(clientLayer)));
 };
 
