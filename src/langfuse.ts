@@ -36,7 +36,9 @@ export class LangfuseClient {
     this.traceState.tracedEventIds.clear();
     this.traceState.tracedReasoningIds.clear();
     this.traceState.pendingReasoningPartsByMessageId.clear();
+    this.traceState.generationSpanStarts.clear();
     this.traceState.generationSpansByMessageId.clear();
+    this.traceState.generationParentSpanStarts.clear();
     this.traceState.generationParentSpans.clear();
     this.traceState.turnObservationsByMessageId.clear();
     this.traceState.latestTurnObservationsBySession.clear();
@@ -136,11 +138,19 @@ export class LangfuseClient {
 
     this.traceState.tracedReasoningIds.add(reasoningTraceKey);
 
+    const timestamp = this.normalizeChildTimestamp({
+      sessionID: input.sessionID,
+      messageID: input.messageID,
+      parentSpan: input.parentSpan,
+      timestamp: input.timestamp,
+      minimumOffsetMs: 10,
+    });
+
     this.traceEvent({
       id: `reasoning:${reasoningTraceKey}`,
       sessionID: input.sessionID,
       name: "opencode.generation.reasoning",
-      timestamp: input.timestamp,
+      timestamp,
       output: { text: input.text },
       metadata: {
         reasoningID: input.reasoningID,
@@ -213,7 +223,7 @@ export class LangfuseClient {
         ...existingStep,
         agent: input.agent,
         model: input.model,
-        started: input.started,
+        started: Math.min(existingStep.started ?? input.started, input.started),
         snapshot: input.snapshot,
       });
 
@@ -221,6 +231,12 @@ export class LangfuseClient {
     }
 
     existingStep?.span.end(new Date(input.started));
+
+    const startTime = Math.min(
+      input.started,
+      this.getEarliestPendingReasoningTimestampForSession(input.sessionID) ??
+        input.started,
+    );
 
     this.withTurnParent(input.sessionID, undefined, () => {
       const span = this.traceState.tracer.startSpan("opencode.generation", {
@@ -235,17 +251,22 @@ export class LangfuseClient {
             snapshot: input.snapshot,
           }),
         },
-        startTime: new Date(input.started),
+        startTime: new Date(startTime),
       });
 
       this.traceState.activeGenerationSteps.set(input.sessionID, {
         agent: input.agent,
         model: input.model,
         span,
-        started: input.started,
+        started: startTime,
         snapshot: input.snapshot,
       });
       this.traceState.generationParentSpans.set(input.sessionID, span);
+      this.traceState.generationParentSpanStarts.set(
+        input.sessionID,
+        startTime,
+      );
+      this.traceState.generationSpanStarts.set(span, startTime);
     });
   }
 
@@ -316,6 +337,7 @@ export class LangfuseClient {
     }
 
     this.traceState.generationParentSpans.delete(input.sessionID);
+    this.traceState.generationParentSpanStarts.delete(input.sessionID);
 
     const span = this.traceState.tracer.startSpan("opencode.turn", {
       attributes: {
@@ -459,13 +481,26 @@ export class LangfuseClient {
         input.messageID,
         step.span,
       );
+      if (!this.traceState.generationSpanStarts.has(step.span)) {
+        this.traceState.generationSpanStarts.set(
+          step.span,
+          step.started ?? input.created,
+        );
+      }
       this.flushPendingReasoning(input.messageID, step.span);
       step.span.end(new Date(input.completed));
       this.traceState.activeGenerationSteps.delete(input.sessionID);
       this.traceState.generationParentSpans.delete(input.sessionID);
+      this.traceState.generationParentSpanStarts.delete(input.sessionID);
 
       return;
     }
+
+    const startTime = Math.min(
+      input.created,
+      this.getEarliestPendingReasoningTimestampForMessage(input.messageID) ??
+        input.created,
+    );
 
     this.withTurnParent(input.sessionID, input.parentID, () => {
       const span = this.traceState.tracer.startSpan("opencode.generation", {
@@ -499,14 +534,20 @@ export class LangfuseClient {
             finish: input.finish,
           }),
         },
-        startTime: new Date(input.created),
+        startTime: new Date(startTime),
       });
 
       this.traceState.generationParentSpans.set(input.sessionID, span);
+      this.traceState.generationParentSpanStarts.set(
+        input.sessionID,
+        startTime,
+      );
+      this.traceState.generationSpanStarts.set(span, startTime);
       this.traceState.generationSpansByMessageId.set(input.messageID, span);
       this.flushPendingReasoning(input.messageID, span);
       span.end(new Date(input.completed));
       this.traceState.generationParentSpans.delete(input.sessionID);
+      this.traceState.generationParentSpanStarts.delete(input.sessionID);
     });
   }
 
@@ -526,6 +567,28 @@ export class LangfuseClient {
         parentSpan,
       });
     }
+  }
+
+  private getEarliestPendingReasoningTimestampForMessage(messageID: string) {
+    const pending =
+      this.traceState.pendingReasoningPartsByMessageId.get(messageID) ?? [];
+    return minReasoningTimestamp(pending);
+  }
+
+  private getEarliestPendingReasoningTimestampForSession(sessionID: string) {
+    let earliest: number | undefined;
+
+    for (const pending of this.traceState.pendingReasoningPartsByMessageId.values()) {
+      for (const part of pending) {
+        if (part.sessionID !== sessionID) {
+          continue;
+        }
+
+        earliest = Math.min(earliest ?? part.time.end, part.time.end);
+      }
+    }
+
+    return earliest;
   }
 
   traceFailedGenerationStep(input: {
@@ -564,6 +627,7 @@ export class LangfuseClient {
       step.span.end(new Date(input.completed));
       this.traceState.activeGenerationSteps.delete(input.sessionID);
       this.traceState.generationParentSpans.delete(input.sessionID);
+      this.traceState.generationParentSpanStarts.delete(input.sessionID);
 
       return;
     }
@@ -589,8 +653,14 @@ export class LangfuseClient {
       });
       span.recordException(input.error);
       this.traceState.generationParentSpans.set(input.sessionID, span);
+      this.traceState.generationParentSpanStarts.set(
+        input.sessionID,
+        input.completed,
+      );
+      this.traceState.generationSpanStarts.set(span, input.completed);
       span.end(new Date(input.completed));
       this.traceState.generationParentSpans.delete(input.sessionID);
+      this.traceState.generationParentSpanStarts.delete(input.sessionID);
     });
   }
 
@@ -682,6 +752,8 @@ export class LangfuseClient {
       return;
     }
 
+    const started = Date.now();
+
     this.withTurnParent(sessionID, undefined, () => {
       const span = this.traceState.tracer.startSpan("opencode.generation", {
         attributes: {
@@ -692,7 +764,68 @@ export class LangfuseClient {
 
       this.traceState.activeGenerationSteps.set(sessionID, { span });
       this.traceState.generationParentSpans.set(sessionID, span);
+      this.traceState.generationParentSpanStarts.set(sessionID, started);
+      this.traceState.generationSpanStarts.set(span, started);
     });
+  }
+
+  private normalizeChildTimestamp(input: {
+    sessionID: string;
+    messageID?: string;
+    parentSpan?: ApiSpan;
+    timestamp: number;
+    minimumOffsetMs?: number;
+  }) {
+    const parentStart = this.getCurrentGenerationStart(input);
+    if (parentStart === undefined) {
+      return input.timestamp;
+    }
+
+    return Math.max(
+      input.timestamp,
+      parentStart + (input.minimumOffsetMs ?? 0),
+    );
+  }
+
+  private getCurrentGenerationStart(input: {
+    sessionID: string;
+    messageID?: string;
+    parentSpan?: ApiSpan;
+  }) {
+    if (input.parentSpan) {
+      const parentSpanStart = this.traceState.generationSpanStarts.get(
+        input.parentSpan,
+      );
+      if (parentSpanStart !== undefined) {
+        return parentSpanStart;
+      }
+    }
+
+    if (input.messageID) {
+      const messageSpan = this.traceState.generationSpansByMessageId.get(
+        input.messageID,
+      );
+      if (messageSpan) {
+        const messageSpanStart =
+          this.traceState.generationSpanStarts.get(messageSpan);
+        if (messageSpanStart !== undefined) {
+          return messageSpanStart;
+        }
+      }
+    }
+
+    const activeStep = this.traceState.activeGenerationSteps.get(
+      input.sessionID,
+    );
+    if (activeStep?.started !== undefined) {
+      return activeStep.started;
+    }
+
+    if (this.traceState.generationParentSpans.has(input.sessionID)) {
+      return this.traceState.generationParentSpanStarts.get(input.sessionID);
+    }
+
+    return undefined;
   }
 
   private withTurnParent<T>(
@@ -750,12 +883,14 @@ export type LangfuseTraceState = {
   tracedReasoningIds: Set<string>;
   toolCallMessageIds: Map<string, string>;
   pendingReasoningPartsByMessageId: Map<string, CompletedReasoningPart[]>;
+  generationSpanStarts: Map<ApiSpan, number>;
   generationSpansByMessageId: Map<string, ApiSpan>;
   assistantParts: Map<string, Map<string, MessagePart>>;
   turnObservationsByMessageId: Map<string, TurnObservation>;
   latestTurnObservationsBySession: Map<string, TurnObservation>;
   activeToolObservations: Map<string, ToolObservation>;
   activeGenerationSteps: Map<string, ActiveGenerationStep>;
+  generationParentSpanStarts: Map<string, number>;
   generationParentSpans: Map<string, ApiSpan>;
 };
 
@@ -781,6 +916,13 @@ function isCompletedReasoningPart(
     typeof part.sessionID === "string" &&
     typeof part.text === "string" &&
     typeof (part as { time?: { end?: unknown } }).time?.end === "number"
+  );
+}
+
+function minReasoningTimestamp(parts: CompletedReasoningPart[]) {
+  return parts.reduce<number | undefined>(
+    (earliest, part) => Math.min(earliest ?? part.time.end, part.time.end),
+    undefined,
   );
 }
 
@@ -884,12 +1026,14 @@ export const createLangfuseClient = (input: {
         string,
         CompletedReasoningPart[]
       >(),
+      generationSpanStarts: new Map<ApiSpan, number>(),
       generationSpansByMessageId: new Map<string, ApiSpan>(),
       assistantParts: new Map<string, Map<string, MessagePart>>(),
       turnObservationsByMessageId: new Map<string, TurnObservation>(),
       latestTurnObservationsBySession: new Map<string, TurnObservation>(),
       activeToolObservations: new Map<string, ToolObservation>(),
       activeGenerationSteps: new Map<string, ActiveGenerationStep>(),
+      generationParentSpanStarts: new Map<string, number>(),
       generationParentSpans: new Map<string, ApiSpan>(),
     };
 

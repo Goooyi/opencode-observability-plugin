@@ -1,2 +1,2 @@
 // TODO: Infer this from package.json at build time.
-export const PLUGIN_VERSION = "0.1.3";
+export const PLUGIN_VERSION = "0.1.7";
