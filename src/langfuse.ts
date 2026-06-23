@@ -34,6 +34,8 @@ export class LangfuseClient {
     this.traceState.assistantParts.clear();
     this.traceState.tracedEventIds.clear();
     this.traceState.tracedReasoningIds.clear();
+    this.traceState.pendingReasoningPartsByMessageId.clear();
+    this.traceState.generationSpansByMessageId.clear();
     this.traceState.generationParentSpans.clear();
     this.traceState.turnObservationsByMessageId.clear();
     this.traceState.latestTurnObservationsBySession.clear();
@@ -74,6 +76,7 @@ export class LangfuseClient {
     input?: unknown;
     output?: unknown;
     metadata?: unknown;
+    parentSpan?: ApiSpan;
   }) {
     if (this.traceState.tracedEventIds.has(input.id)) {
       return;
@@ -81,7 +84,7 @@ export class LangfuseClient {
 
     this.traceState.tracedEventIds.add(input.id);
 
-    this.withObservationParent(input.sessionID, () => {
+    const startEvent = () => {
       const span = this.traceState.tracer.startSpan(input.name, {
         attributes: {
           "langfuse.observation.type": "event",
@@ -98,7 +101,17 @@ export class LangfuseClient {
       });
 
       span.end(new Date(input.timestamp));
-    });
+    };
+
+    if (input.parentSpan) {
+      context.with(
+        trace.setSpan(context.active(), input.parentSpan),
+        startEvent,
+      );
+      return;
+    }
+
+    this.withObservationParent(input.sessionID, startEvent);
   }
 
   traceReasoning(input: {
@@ -108,6 +121,7 @@ export class LangfuseClient {
     text: string;
     messageID?: string;
     source: string;
+    parentSpan?: ApiSpan;
   }) {
     if (!input.text.trim()) {
       return;
@@ -132,11 +146,28 @@ export class LangfuseClient {
         messageID: input.messageID,
         source: input.source,
       },
+      parentSpan: input.parentSpan,
     });
   }
 
   traceReasoningPart(part: MessagePart) {
     if (!isCompletedReasoningPart(part)) {
+      return;
+    }
+
+    const generationSpan = this.traceState.generationSpansByMessageId.get(
+      part.messageID,
+    );
+
+    if (!generationSpan) {
+      const pending =
+        this.traceState.pendingReasoningPartsByMessageId.get(part.messageID) ??
+        [];
+      pending.push(part);
+      this.traceState.pendingReasoningPartsByMessageId.set(
+        part.messageID,
+        pending,
+      );
       return;
     }
 
@@ -148,6 +179,7 @@ export class LangfuseClient {
       messageID:
         typeof part.messageID === "string" ? part.messageID : undefined,
       source: "message.part.updated",
+      parentSpan: generationSpan,
     });
   }
 
@@ -418,6 +450,11 @@ export class LangfuseClient {
         }),
       );
 
+      this.traceState.generationSpansByMessageId.set(
+        input.messageID,
+        step.span,
+      );
+      this.flushPendingReasoning(input.messageID, step.span);
       step.span.end(new Date(input.completed));
       this.traceState.activeGenerationSteps.delete(input.sessionID);
 
@@ -460,8 +497,28 @@ export class LangfuseClient {
       });
 
       this.traceState.generationParentSpans.set(input.sessionID, span);
+      this.traceState.generationSpansByMessageId.set(input.messageID, span);
+      this.flushPendingReasoning(input.messageID, span);
       span.end(new Date(input.completed));
     });
+  }
+
+  private flushPendingReasoning(messageID: string, parentSpan: ApiSpan) {
+    const pending =
+      this.traceState.pendingReasoningPartsByMessageId.get(messageID) ?? [];
+    this.traceState.pendingReasoningPartsByMessageId.delete(messageID);
+
+    for (const part of pending) {
+      this.traceReasoning({
+        reasoningID: part.id,
+        sessionID: part.sessionID,
+        timestamp: part.time.end,
+        text: part.text,
+        messageID: part.messageID,
+        source: "message.part.updated",
+        parentSpan,
+      });
+    }
   }
 
   traceFailedGenerationStep(input: {
@@ -664,6 +721,8 @@ export type LangfuseTraceState = {
   tracedGenerationIds: Set<string>;
   tracedEventIds: Set<string>;
   tracedReasoningIds: Set<string>;
+  pendingReasoningPartsByMessageId: Map<string, CompletedReasoningPart[]>;
+  generationSpansByMessageId: Map<string, ApiSpan>;
   assistantParts: Map<string, Map<string, MessagePart>>;
   turnObservationsByMessageId: Map<string, TurnObservation>;
   latestTurnObservationsBySession: Map<string, TurnObservation>;
@@ -792,6 +851,11 @@ export const createLangfuseClient = (input: {
       tracedGenerationIds: new Set<string>(),
       tracedEventIds: new Set<string>(),
       tracedReasoningIds: new Set<string>(),
+      pendingReasoningPartsByMessageId: new Map<
+        string,
+        CompletedReasoningPart[]
+      >(),
+      generationSpansByMessageId: new Map<string, ApiSpan>(),
       assistantParts: new Map<string, Map<string, MessagePart>>(),
       turnObservationsByMessageId: new Map<string, TurnObservation>(),
       latestTurnObservationsBySession: new Map<string, TurnObservation>(),
