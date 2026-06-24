@@ -2,11 +2,11 @@
 
 OpenCode plugin that sends OpenCode session telemetry to Langfuse. It traces user turns, assistant generations, tool calls, retries, reasoning output, compaction output, and failed generation steps.
 
-This fork is V2-event-first. When OpenCode emits `session.next.*` events, it uses those events keyed by `assistantMessageID` and `callID`. It also supports the common `message.updated` / `message.part.updated` event stream used by OpenCode server integrations. If OpenCode's plugin event hook does not deliver assistant events in server mode, the plugin falls back to polling OpenCode's own session messages through the SDK and emits the same generation, reasoning, and tool observations from the completed message snapshot.
+This fork is V2-event-first. When OpenCode emits `session.next.*` events, it uses those events keyed by `assistantMessageID` and `callID`. It also supports the common `message.updated` / `message.part.updated` event stream used by OpenCode server integrations. It does not poll completed session messages to reconstruct traces; if OpenCode does not deliver assistant events to the plugin hook, the missing events should be fixed at the OpenCode event/plugin boundary.
 
 If `OPENCODE_TRACEPARENT` or `TRACEPARENT` is set, plugin spans join that W3C trace. This lets a host application create a platform trace first, start OpenCode with the traceparent in the environment, and get OpenCode generation/tool/reasoning spans as children of the platform trace.
 
-Plugin hooks are serialized in arrival order inside the plugin. This preserves the natural `step.started -> reasoning/tool/text -> step.ended -> session.idle` sequence when V2 events are available, and keeps message-update or session-snapshot fallback observations idempotent when OpenCode emits repeated part updates.
+Plugin hooks are serialized in arrival order inside the plugin. This preserves the natural `step.started -> reasoning/tool/text -> step.ended -> session.idle` sequence when V2 events are available, and keeps message-update observations idempotent when OpenCode emits repeated part updates.
 
 The hooks are intentionally non-blocking from OpenCode's point of view. OpenCode may await plugin hook return values during API requests such as `POST /session`; this plugin queues telemetry internally and returns immediately so Langfuse export latency cannot stall agent sessions.
 

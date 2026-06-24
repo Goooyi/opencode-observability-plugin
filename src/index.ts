@@ -9,10 +9,7 @@ import {
   LangfuseClientService,
   createLangfuseClient,
   type ActiveGenerationStep,
-  type LangfuseClient,
-  type MessagePart,
   type TokenUsage,
-  type UpdatedMessage,
 } from "./langfuse.js";
 import { OpencodeClientService } from "./opencode.js";
 import { log } from "./utils.js";
@@ -346,110 +343,6 @@ const eventHook = (event: OpencodeEvent) =>
     }
   });
 
-const pollSessionMessages = (sessionID: string) =>
-  Effect.gen(function* () {
-    const opencode = yield* OpencodeClientService;
-    const langfuse = yield* LangfuseClientService;
-    const started = Date.now();
-    let lastMessages: unknown[] = [];
-
-    while (Date.now() - started < messagePollTimeoutMs()) {
-      const response = yield* Effect.tryPromise({
-        try: () =>
-          opencode.session.messages({
-            path: { id: sessionID },
-            query: { limit: 50 },
-            throwOnError: true,
-          }),
-        catch: (error) => error,
-      });
-      const messages = readMessageList(response);
-      if (messages.length > 0) lastMessages = messages;
-
-      if (traceAssistantSnapshots(langfuse, sessionID, messages)) {
-        yield* langfuse.forceFlush;
-        return;
-      }
-
-      yield* Effect.promise(
-        () =>
-          new Promise((resolve) =>
-            setTimeout(resolve, messagePollIntervalMs()),
-          ),
-      );
-    }
-
-    traceAssistantSnapshots(langfuse, sessionID, lastMessages);
-    yield* langfuse.forceFlush;
-  });
-
-function traceAssistantSnapshots(
-  langfuse: LangfuseClient,
-  sessionID: string,
-  messages: unknown[],
-): boolean {
-  const assistantMessages = messages
-    .map(readAssistantMessage)
-    .filter(
-      (message): message is { info: UpdatedMessage; parts: MessagePart[] } =>
-        Boolean(message),
-    );
-  let latestCompletedText = false;
-  for (const message of assistantMessages) {
-    const completed = langfuse.traceAssistantMessageSnapshot({
-      sessionID,
-      message: message.info,
-      parts: message.parts,
-    });
-    const hasText = message.parts.some(
-      (part) => part.type === "text" && typeof part.text === "string",
-    );
-    if (completed && hasText) latestCompletedText = true;
-  }
-  return latestCompletedText;
-}
-
-function readMessageList(response: unknown): unknown[] {
-  if (Array.isArray(response)) return response;
-  if (isRecord(response) && Array.isArray(response.data)) return response.data;
-  return [];
-}
-
-function readAssistantMessage(
-  value: unknown,
-): { info: UpdatedMessage; parts: MessagePart[] } | undefined {
-  if (!isRecord(value)) return undefined;
-  const info = isRecord(value.info) ? value.info : value;
-  if (info.role !== "assistant") return undefined;
-  const parts = Array.isArray(value.parts)
-    ? value.parts
-    : Array.isArray(value.content)
-      ? value.content
-      : [];
-  return {
-    info: info as UpdatedMessage,
-    parts: parts.filter(isRecord) as MessagePart[],
-  };
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function messagePollTimeoutMs(): number {
-  const parsed = Number(
-    process.env.LANGFUSE_OPENCODE_MESSAGE_POLL_TIMEOUT_MS ?? 180_000,
-  );
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : 180_000;
-}
-
-function messagePollIntervalMs(): number {
-  const parsed = Number(
-    process.env.LANGFUSE_OPENCODE_MESSAGE_POLL_INTERVAL_MS ?? 1_000,
-  );
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : 1_000;
-}
-
 const formatHookError = (error: unknown) => {
   if (error instanceof Error) {
     return error.stack ?? error.message;
@@ -582,10 +475,6 @@ const main = Effect.gen(function* () {
             }),
           catch: (error) => error,
         }),
-      );
-      void enqueueHook(
-        "session.messages.poll",
-        pollSessionMessages(input.sessionID),
       );
       return Promise.resolve();
     },
