@@ -1,12 +1,12 @@
 # Langfuse OpenCode Plugin
 
-OpenCode plugin that sends OpenCode V2 session events to Langfuse. It traces user turns, assistant generations, tool calls, retries, reasoning output, compaction output, and failed generation steps.
+OpenCode plugin that sends OpenCode session telemetry to Langfuse. It traces user turns, assistant generations, tool calls, retries, reasoning output, compaction output, and failed generation steps.
 
-This fork is V2-event-first. It uses `session.next.*` events keyed by `assistantMessageID` and `callID`, so it does not infer tool/reasoning parents from legacy `message.part.updated` events.
+This fork is V2-event-first. When OpenCode emits `session.next.*` events, it uses those events keyed by `assistantMessageID` and `callID`. It also supports the common `message.updated` / `message.part.updated` event stream used by OpenCode server integrations. If OpenCode's plugin event hook does not deliver assistant events in server mode, the plugin falls back to polling OpenCode's own session messages through the SDK and emits the same generation, reasoning, and tool observations from the completed message snapshot.
 
 If `OPENCODE_TRACEPARENT` or `TRACEPARENT` is set, plugin spans join that W3C trace. This lets a host application create a platform trace first, start OpenCode with the traceparent in the environment, and get OpenCode generation/tool/reasoning spans as children of the platform trace.
 
-V2 plugin hooks are serialized in arrival order inside the plugin. This preserves the natural `step.started -> reasoning/tool/text -> step.ended -> session.idle` sequence without timestamp offsets or inferred parent reconstruction.
+Plugin hooks are serialized in arrival order inside the plugin. This preserves the natural `step.started -> reasoning/tool/text -> step.ended -> session.idle` sequence when V2 events are available, and keeps message-update or session-snapshot fallback observations idempotent when OpenCode emits repeated part updates.
 
 The hooks are intentionally non-blocking from OpenCode's point of view. OpenCode may await plugin hook return values during API requests such as `POST /session`; this plugin queues telemetry internally and returns immediately so Langfuse export latency cannot stall agent sessions.
 
@@ -22,7 +22,7 @@ Enable the plugin in your `opencode.json` or `opencode.jsonc`:
 }
 ```
 
-Enable OpenCode V2 session events before starting OpenCode:
+Enable OpenCode V2 session events before starting OpenCode when your OpenCode version supports them:
 
 ```bash
 export OPENCODE_EXPERIMENTAL_EVENT_SYSTEM=true
@@ -30,13 +30,11 @@ export OPENCODE_EXPERIMENTAL_EVENT_SYSTEM=true
 
 Restart OpenCode after changing the config.
 
-OpenCode native `experimental.openTelemetry` is optional and separate. This plugin creates its own Langfuse OTEL spans from V2 events so reasoning text can be captured.
+OpenCode native `experimental.openTelemetry` is optional and separate. This plugin creates its own Langfuse OTEL spans from OpenCode plugin events so reasoning text can be captured.
 
 ## Host-Managed OpenCode Servers
 
-If your application owns the OpenCode server process and already consumes OpenCode's `/event` stream, prefer recording those V2 events in the host application. That path gives the host exact control over platform trace parenting, session lifecycle, retries, and shutdown.
-
-Use this plugin when OpenCode's plugin runtime is the telemetry boundary, for example local OpenCode usage or deployments where plugin hooks are the cleanest integration point. In both cases the event source is the same V2 `session.next.*` event stream.
+Use this plugin when OpenCode's plugin runtime is the telemetry boundary, including host-managed `opencode serve` deployments. Host applications should pass `TRACEPARENT` or `OPENCODE_TRACEPARENT` to the OpenCode process when they want OpenCode observations to join an existing platform trace. The host can still consume OpenCode's `/event` stream for live UI, while this plugin owns durable Langfuse generation/tool/reasoning traces.
 
 ## Langfuse Credentials
 

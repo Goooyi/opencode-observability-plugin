@@ -44,6 +44,8 @@ export class LangfuseClient {
     this.traceState.tracedGenerationIds.clear();
     this.traceState.tracedEventIds.clear();
     this.traceState.tracedReasoningIds.clear();
+    this.traceState.tracedToolCallIds.clear();
+    this.traceState.tracedToolResultIds.clear();
     this.traceState.textPartsByAssistantMessageId.clear();
     this.traceState.generationSpansByAssistantMessageId.clear();
     this.traceState.turnObservationsByMessageId.clear();
@@ -207,14 +209,173 @@ export class LangfuseClient {
     });
   }
 
+  traceMessageUpdated(input: { sessionID: string; message: UpdatedMessage }) {
+    if (input.message.role !== "assistant") return;
+
+    this.startGenerationStep({
+      sessionID: input.sessionID,
+      assistantMessageID: input.message.id,
+      model: {
+        id: input.message.modelID,
+        providerID: input.message.providerID,
+      },
+      timestamp: input.message.time.created,
+    });
+
+    if (input.message.error) {
+      this.failGenerationStep({
+        sessionID: input.sessionID,
+        assistantMessageID: input.message.id,
+        timestamp: input.message.time.completed ?? input.message.time.created,
+        error: {
+          message: extractErrorMessage(input.message.error),
+        },
+      });
+      return;
+    }
+
+    if (input.message.time.completed == null) return;
+
+    this.finishGenerationStep({
+      sessionID: input.sessionID,
+      assistantMessageID: input.message.id,
+      timestamp: input.message.time.completed,
+      finish: input.message.finish ?? "unknown",
+      cost: input.message.cost,
+      tokens: input.message.tokens,
+    });
+  }
+
+  traceMessagePartUpdated(input: {
+    sessionID: string;
+    part: MessagePart;
+    timestamp: number;
+  }) {
+    const part = input.part;
+    if (part.type === "text") {
+      this.recordAssistantText({
+        assistantMessageID: part.messageID,
+        textID: part.id,
+        text: part.text,
+      });
+      return;
+    }
+
+    if (part.type === "reasoning") {
+      this.traceReasoning({
+        assistantMessageID: part.messageID,
+        reasoningID: part.id,
+        sessionID: input.sessionID,
+        timestamp: part.time.end ?? input.timestamp,
+        text: part.text,
+        providerMetadata: part.metadata,
+      });
+      return;
+    }
+
+    if (part.type !== "tool") return;
+    const state = part.state;
+    if (state.status === "pending") return;
+
+    const start = "time" in state ? state.time.start : input.timestamp;
+    this.traceToolCalled({
+      sessionID: input.sessionID,
+      assistantMessageID: part.messageID,
+      callID: part.callID,
+      tool: part.tool,
+      args: state.input,
+      timestamp: start,
+      provider: part.metadata,
+    });
+
+    if (state.status === "completed") {
+      this.traceToolSuccess({
+        callID: part.callID,
+        timestamp: state.time.end,
+        output: {
+          output: state.output,
+          title: state.title,
+          metadata: state.metadata,
+          attachments: state.attachments,
+        },
+        provider: part.metadata,
+      });
+    }
+
+    if (state.status === "error") {
+      this.traceToolFailed({
+        callID: part.callID,
+        timestamp: state.time.end,
+        error: state.error,
+        result: state.metadata,
+        provider: part.metadata,
+      });
+    }
+  }
+
+  traceAssistantMessageSnapshot(input: {
+    sessionID: string;
+    message: UpdatedMessage;
+    parts: MessagePart[];
+  }) {
+    if (input.message.role !== "assistant") return false;
+    if (this.traceState.tracedGenerationIds.has(input.message.id)) return true;
+
+    this.startGenerationStep({
+      sessionID: input.sessionID,
+      assistantMessageID: input.message.id,
+      model: {
+        id: input.message.modelID,
+        providerID: input.message.providerID,
+      },
+      timestamp: input.message.time.created,
+    });
+
+    for (const part of input.parts) {
+      this.traceMessagePartUpdated({
+        sessionID: input.sessionID,
+        part,
+        timestamp: Date.now(),
+      });
+    }
+
+    if (input.message.error) {
+      this.failGenerationStep({
+        sessionID: input.sessionID,
+        assistantMessageID: input.message.id,
+        timestamp: input.message.time.completed ?? input.message.time.created,
+        error: {
+          message: extractErrorMessage(input.message.error),
+        },
+      });
+      return true;
+    }
+
+    if (input.message.time.completed == null) return false;
+
+    this.finishGenerationStep({
+      sessionID: input.sessionID,
+      assistantMessageID: input.message.id,
+      timestamp: input.message.time.completed,
+      finish: input.message.finish ?? "unknown",
+      cost: input.message.cost,
+      tokens: input.message.tokens,
+    });
+    return true;
+  }
+
   startGenerationStep(input: {
     sessionID: string;
     assistantMessageID: string;
-    agent: string;
+    agent?: string;
     model: NonNullable<ActiveGenerationStep["model"]>;
     timestamp: number;
     snapshot?: string;
   }) {
+    if (this.traceState.tracedGenerationIds.has(input.assistantMessageID)) {
+      return;
+    }
+
     const existing = this.traceState.generationSpansByAssistantMessageId.get(
       input.assistantMessageID,
     );
@@ -401,6 +562,8 @@ export class LangfuseClient {
     timestamp: number;
     provider?: unknown;
   }) {
+    if (this.traceState.tracedToolCallIds.has(input.callID)) return;
+    this.traceState.tracedToolCallIds.add(input.callID);
     this.traceState.activeToolObservations.get(input.callID)?.span.end();
 
     const parent = this.traceState.generationSpansByAssistantMessageId.get(
@@ -469,8 +632,10 @@ export class LangfuseClient {
     provider?: unknown,
     error?: unknown,
   ) {
+    if (this.traceState.tracedToolResultIds.has(callID)) return;
     const observation = this.traceState.activeToolObservations.get(callID);
     if (!observation) return;
+    this.traceState.tracedToolResultIds.add(callID);
 
     observation.span.setAttribute(
       "langfuse.observation.output",
@@ -538,6 +703,8 @@ export type LangfuseTraceState = {
   tracedGenerationIds: Set<string>;
   tracedEventIds: Set<string>;
   tracedReasoningIds: Set<string>;
+  tracedToolCallIds: Set<string>;
+  tracedToolResultIds: Set<string>;
   textPartsByAssistantMessageId: Map<string, Map<string, string>>;
   generationSpansByAssistantMessageId: Map<string, ActiveGenerationStep>;
   turnObservationsByMessageId: Map<string, TurnObservation>;
@@ -549,6 +716,11 @@ export type MessagePart = Extract<
   Parameters<NonNullable<Hooks["event"]>>[0]["event"],
   { type: "message.part.updated" }
 >["properties"]["part"];
+
+export type UpdatedMessage = Extract<
+  Parameters<NonNullable<Hooks["event"]>>[0]["event"],
+  { type: "message.updated" }
+>["properties"]["info"];
 
 export type FormattedMessagePart =
   | { type: string; text: string }
@@ -653,6 +825,8 @@ export const createLangfuseClient = (input: {
       tracedGenerationIds: new Set<string>(),
       tracedEventIds: new Set<string>(),
       tracedReasoningIds: new Set<string>(),
+      tracedToolCallIds: new Set<string>(),
+      tracedToolResultIds: new Set<string>(),
       textPartsByAssistantMessageId: new Map<string, Map<string, string>>(),
       generationSpansByAssistantMessageId: new Map<
         string,
@@ -717,6 +891,21 @@ function formatMessagePart(part: MessagePart): FormattedMessagePart {
     };
   }
   return { type: part.type };
+}
+
+function extractErrorMessage(error: unknown) {
+  if (typeof error === "object" && error !== null && "data" in error) {
+    const data = (error as { data?: unknown }).data;
+    if (typeof data === "object" && data !== null && "message" in data) {
+      const message = (data as { message?: unknown }).message;
+      if (typeof message === "string") return message;
+    }
+  }
+  if (typeof error === "object" && error !== null && "message" in error) {
+    const message = (error as { message?: unknown }).message;
+    if (typeof message === "string") return message;
+  }
+  return stringify(error);
 }
 
 function stringify(input: unknown) {
