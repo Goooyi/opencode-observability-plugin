@@ -1,14 +1,9 @@
 import { Effect } from "effect";
 
-import { OpencodeClientService } from "./opencode.js";
-
 export const log = (level: "info" | "warn" | "error", message: string) =>
-  Effect.gen(function* () {
-    const opencode = yield* OpencodeClientService;
-
-    yield* Effect.sync(() =>
-      opencode.app.log({
-        body: { service: "langfuse", level, message },
-      }),
-    );
+  Effect.sync(() => {
+    const prefix = `[opencode-langfuse] ${message}`;
+    if (level === "error") console.error(prefix);
+    else if (level === "warn") console.warn(prefix);
+    else console.info(prefix);
   });

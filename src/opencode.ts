@@ -3,6 +3,7 @@ import { Context as EffectContext } from "effect";
 
 export type OpencodeClient = {
   app: PluginInput["client"]["app"];
+  event: PluginInput["client"]["event"];
   session: PluginInput["client"]["session"];
 };
 

@@ -137,9 +137,19 @@ type SessionNextEvent =
       };
     };
 
+type SessionStatusEvent = {
+  id: string;
+  type: "session.status";
+  properties: {
+    sessionID: string;
+    status: { type: "idle" | "busy" | "retry"; [key: string]: unknown };
+  };
+};
+
 type OpencodeEvent =
   | Parameters<NonNullable<Hooks["event"]>>[0]["event"]
-  | SessionNextEvent;
+  | SessionNextEvent
+  | SessionStatusEvent;
 
 const LangfuseCredentialsSchema = Schema.Struct({
   publicKey: Schema.NonEmptyString,
@@ -195,7 +205,7 @@ const eventHook = (event: OpencodeEvent) =>
   Effect.gen(function* () {
     const langfuse = yield* LangfuseClientService;
 
-    if (event.type === "session.idle") {
+    if (isIdleOpenCodeEvent(event)) {
       yield* log("info", "Flushing spans");
       langfuse.endActiveToolObservations();
       langfuse.endActiveGenerationSteps();
@@ -440,7 +450,6 @@ const main = Effect.gen(function* () {
     );
     return hookQueue;
   };
-
   const hooks: Hooks = {
     dispose: async () => {
       await hookQueue.catch(() => undefined);
@@ -489,3 +498,22 @@ export const LangfusePlugin: Plugin = async ({ client }) => {
 };
 
 export default LangfusePlugin;
+
+function isIdleOpenCodeEvent(event: unknown): boolean {
+  if (!isRecord(event)) return false;
+  if (event.type === "session.idle") return true;
+  if (event.type !== "session.status") return false;
+  const properties = eventProperties(event);
+  const status = properties?.status;
+  return isRecord(status) && status.type === "idle";
+}
+
+function eventProperties(event: unknown): Record<string, unknown> | undefined {
+  if (!isRecord(event)) return undefined;
+  const properties = event.properties;
+  return isRecord(properties) ? properties : undefined;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
