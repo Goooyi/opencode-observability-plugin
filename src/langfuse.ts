@@ -1,4 +1,12 @@
 import { LangfuseAPIClient, type IngestionEvent } from "@langfuse/core";
+import { LangfuseSpanProcessor } from "@langfuse/otel";
+import {
+  setLangfuseTracerProvider,
+  startObservation,
+  type LangfuseTool,
+} from "@langfuse/tracing";
+import { TraceFlags, type SpanContext } from "@opentelemetry/api";
+import { BasicTracerProvider } from "@opentelemetry/sdk-trace-base";
 import { Context as EffectContext, Effect } from "effect";
 import { createHash, randomUUID } from "node:crypto";
 
@@ -53,6 +61,7 @@ export type ActiveGenerationStep = {
 
 type ToolObservation = {
   id: string;
+  observation: LangfuseTool;
   assistantMessageID: string;
   callID: string;
   sessionID: string;
@@ -87,11 +96,18 @@ export class LangfuseClient {
       api: LangfuseAPIClient;
       baseUrl: string;
       state: LangfuseTraceState;
+      toolTraceProvider: BasicTracerProvider;
     },
   ) {
     this.baseUrl = input.baseUrl;
-    this.forceFlush = Effect.tryPromise(() => this.queue);
-    this.shutdown = this.forceFlush;
+    this.forceFlush = Effect.tryPromise(async () => {
+      await this.queue;
+      await this.input.toolTraceProvider.forceFlush();
+    });
+    this.shutdown = Effect.tryPromise(async () => {
+      await this.queue;
+      await this.input.toolTraceProvider.shutdown();
+    });
   }
 
   clearTraceState() {
@@ -109,18 +125,9 @@ export class LangfuseClient {
   }
 
   endActiveToolObservations() {
-    const now = new Date().toISOString();
+    const now = new Date();
     for (const tool of this.input.state.activeTools.values()) {
-      this.emit({
-        type: "span-update",
-        id: randomUUID(),
-        timestamp: now,
-        body: {
-          id: tool.id,
-          endTime: now,
-          environment: this.input.state.environment,
-        },
-      });
+      tool.observation.end(now);
     }
     this.input.state.activeTools.clear();
   }
@@ -606,36 +613,34 @@ export class LangfuseClient {
     if (!input.callID || this.input.state.tracedToolCallIds.has(input.callID))
       return;
     this.input.state.tracedToolCallIds.add(input.callID);
-    const id = stableObservationId(`tool:${input.callID}`);
-    this.input.state.activeTools.set(input.callID, {
-      id,
-      assistantMessageID: input.assistantMessageID,
-      callID: input.callID,
-      sessionID: input.sessionID,
-      tool: input.tool,
-    });
-    this.emit({
-      type: "span-create",
-      id: randomUUID(),
-      timestamp: iso(input.timestamp),
-      body: compact({
-        id,
-        traceId: this.input.state.traceId,
-        parentObservationId:
-          this.generationParent(input.assistantMessageID) ??
-          this.parentForSession(input.sessionID),
-        name: `tool.${input.tool}`,
-        startTime: iso(input.timestamp),
+    const parentObservationId =
+      this.generationParent(input.assistantMessageID) ??
+      this.parentForSession(input.sessionID);
+    const observation = startObservation(
+      `tool.${input.tool}`,
+      {
         input: input.args,
         metadata: {
           assistantMessageID: input.assistantMessageID,
           callID: input.callID,
           provider: input.provider,
           tool: input.tool,
-          observationType: "tool",
         },
         environment: this.input.state.environment,
-      }),
+      },
+      {
+        asType: "tool",
+        startTime: new Date(input.timestamp ?? Date.now()),
+        parentSpanContext: this.parentSpanContext(parentObservationId),
+      },
+    );
+    this.input.state.activeTools.set(input.callID, {
+      id: observation.id,
+      observation,
+      assistantMessageID: input.assistantMessageID,
+      callID: input.callID,
+      sessionID: input.sessionID,
+      tool: input.tool,
     });
   }
 
@@ -675,13 +680,8 @@ export class LangfuseClient {
     const tool = this.input.state.activeTools.get(callID);
     if (!tool) return;
     this.input.state.tracedToolResultIds.add(callID);
-    this.emit({
-      type: "span-update",
-      id: randomUUID(),
-      timestamp: iso(timestamp),
-      body: compact({
-        id: tool.id,
-        endTime: iso(timestamp),
+    tool.observation.update(
+      compact({
         output,
         metadata: {
           assistantMessageID: tool.assistantMessageID,
@@ -698,7 +698,8 @@ export class LangfuseClient {
           : {}),
         environment: this.input.state.environment,
       }),
-    });
+    );
+    tool.observation.end(new Date(timestamp ?? Date.now()));
     this.input.state.activeTools.delete(callID);
   }
 
@@ -713,6 +714,22 @@ export class LangfuseClient {
     return this.input.state.generationByAssistantMessageId.get(
       assistantMessageID,
     )?.id;
+  }
+
+  private parentSpanContext(parentObservationId: string | undefined) {
+    if (
+      !parentObservationId ||
+      !isTraceId(this.input.state.traceId) ||
+      !isSpanId(parentObservationId)
+    ) {
+      return undefined;
+    }
+    return {
+      traceId: this.input.state.traceId,
+      spanId: parentObservationId,
+      traceFlags: TraceFlags.SAMPLED,
+      isRemote: true,
+    } satisfies SpanContext;
   }
 
   private getAssistantText(assistantMessageID: string) {
@@ -788,7 +805,26 @@ export const createLangfuseClient = (input: {
       xLangfuseSdkVersion: () => PLUGIN_VERSION,
       xLangfusePublicKey: () => input.publicKey,
     });
-    return new LangfuseClient({ api, baseUrl: input.baseUrl, state });
+    const toolTraceProvider = new BasicTracerProvider({
+      spanProcessors: [
+        new LangfuseSpanProcessor({
+          publicKey: input.publicKey,
+          secretKey: input.secretKey,
+          baseUrl: input.baseUrl,
+          environment: input.environment,
+          exportMode: "immediate",
+          flushAt: 1,
+          flushInterval: 1,
+        }),
+      ],
+    });
+    setLangfuseTracerProvider(toolTraceProvider);
+    return new LangfuseClient({
+      api,
+      baseUrl: input.baseUrl,
+      state,
+      toolTraceProvider,
+    });
   });
 
 function parseTraceparent(traceparent: string | undefined) {
@@ -804,6 +840,14 @@ function parseTraceparent(traceparent: string | undefined) {
 
 function stableTraceId(seed: string) {
   return createHash("sha256").update(seed).digest("hex").slice(0, 32);
+}
+
+function isTraceId(value: string) {
+  return /^[0-9a-f]{32}$/i.test(value);
+}
+
+function isSpanId(value: string) {
+  return /^[0-9a-f]{16}$/i.test(value);
 }
 
 function stableObservationId(seed: string) {
