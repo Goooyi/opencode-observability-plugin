@@ -4,9 +4,9 @@ import { join } from "node:path";
 
 import type { Hooks, Plugin } from "@opencode-ai/plugin";
 import {
-  createOpencodeClient as createOpencodeV2Client,
-  type OpencodeClient as OpencodeV2Client,
-} from "@opencode-ai/sdk/v2";
+  createOpencodeClient as createOpencodeMetadataClient,
+  type OpencodeClient as MetadataOpencodeClient,
+} from "@opencode-ai/sdk";
 import { Data, Effect, Layer, Schema } from "effect";
 
 import {
@@ -15,7 +15,6 @@ import {
   type ActiveGenerationStep,
   type TokenUsage,
 } from "./langfuse.js";
-import { OpencodeClientService } from "./opencode.js";
 import { log } from "./utils.js";
 
 // opencode emits these session.next.* events at runtime, but the published
@@ -372,22 +371,25 @@ const eventHook = (event: OpencodeEvent) =>
   });
 
 const rememberSessionFromClient = (input: {
-  client: OpencodeV2Client;
+  client: MetadataOpencodeClient;
   langfuse: import("./langfuse.js").LangfuseClient;
   sessionID: string;
-  directory: string;
 }) =>
   Effect.tryPromise({
     try: async () => {
       if (input.langfuse.hasSessionTraceContext(input.sessionID)) return;
       const response = await input.client.session.get<true>(
-        { sessionID: input.sessionID, directory: input.directory },
-        { throwOnError: true },
+        {
+          path: { id: input.sessionID },
+          throwOnError: true,
+        },
       );
-      const data = isRecord(response.data) ? response.data : undefined;
+      const session = isRecord(response.data as unknown)
+        ? (response.data as Record<string, unknown>)
+        : undefined;
       input.langfuse.rememberSession({
         sessionID: input.sessionID,
-        metadata: data?.metadata,
+        metadata: session?.metadata,
       });
     },
     catch: (error) => error,
@@ -405,10 +407,8 @@ const formatHookError = (error: unknown) => {
   }
 };
 
-const main = (context: { v2Client: OpencodeV2Client; directory: string }) =>
+const main = (context: { metadataClient: MetadataOpencodeClient }) =>
   Effect.gen(function* () {
-    const opencode = yield* OpencodeClientService;
-
     const langfuse = yield* Effect.gen(function* () {
       const credentials = yield* loadLangfuseCredentials;
 
@@ -444,18 +444,11 @@ const main = (context: { v2Client: OpencodeV2Client; directory: string }) =>
       return {};
     }
 
-    const hooksLayer = Layer.merge(
-      Layer.succeed(OpencodeClientService, opencode),
-      Layer.succeed(LangfuseClientService, langfuse),
-    );
+    const hooksLayer = Layer.succeed(LangfuseClientService, langfuse);
 
     const runHook = (
       hookName: string,
-      effect: Effect.Effect<
-        unknown,
-        unknown,
-        OpencodeClientService | LangfuseClientService
-      >,
+      effect: Effect.Effect<unknown, unknown, LangfuseClientService>,
     ) =>
       Effect.runPromise(
         effect.pipe(
@@ -479,11 +472,7 @@ const main = (context: { v2Client: OpencodeV2Client; directory: string }) =>
     let hookQueue = Promise.resolve();
     const enqueueHook = (
       hookName: string,
-      effect: Effect.Effect<
-        unknown,
-        unknown,
-        OpencodeClientService | LangfuseClientService
-      >,
+      effect: Effect.Effect<unknown, unknown, LangfuseClientService>,
     ) => {
       hookQueue = hookQueue.then(
         () => runHook(hookName, effect),
@@ -515,11 +504,17 @@ const main = (context: { v2Client: OpencodeV2Client; directory: string }) =>
         void enqueueHook(
           "chat.message",
           Effect.gen(function* () {
+            const metadata = traceMetadataFromParts(output.parts);
+            if (metadata) {
+              langfuse.rememberSession({
+                sessionID: input.sessionID,
+                metadata,
+              });
+            }
             yield* rememberSessionFromClient({
-              client: context.v2Client,
+              client: context.metadataClient,
               langfuse,
               sessionID: input.sessionID,
-              directory: context.directory,
             });
             langfuse.traceUserMessage({
               sessionID: input.sessionID,
@@ -537,16 +532,11 @@ const main = (context: { v2Client: OpencodeV2Client; directory: string }) =>
     return hooks;
   });
 
-export const LangfusePlugin: Plugin = async ({
-  client,
-  serverUrl,
-  directory,
-}) => {
-  const v2Client = createOpencodeV2Client({ baseUrl: serverUrl.toString() });
-  const clientLayer = Layer.succeed(OpencodeClientService, client);
-  return Effect.runPromise(
-    main({ v2Client, directory }).pipe(Effect.provide(clientLayer)),
-  );
+export const LangfusePlugin: Plugin = async ({ serverUrl }) => {
+  const metadataClient = createOpencodeMetadataClient({
+    baseUrl: serverUrl.toString(),
+  });
+  return Effect.runPromise(main({ metadataClient }));
 };
 
 export default LangfusePlugin;
@@ -570,6 +560,17 @@ function sessionInfo(event: unknown): Record<string, unknown> | undefined {
   const properties = eventProperties(event);
   const info = properties?.info;
   return isRecord(info) ? info : undefined;
+}
+
+function traceMetadataFromParts(parts: unknown): Record<string, unknown> | undefined {
+  if (!Array.isArray(parts)) return undefined;
+  for (const part of parts) {
+    if (!isRecord(part)) continue;
+    const metadata = part.metadata;
+    if (!isRecord(metadata)) continue;
+    if (stringValue(metadata.traceparent)) return metadata;
+  }
+  return undefined;
 }
 
 function stringValue(value: unknown): string {

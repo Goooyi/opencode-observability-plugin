@@ -178,7 +178,10 @@ export class LangfuseClient {
     const metadata = isRecord(input.metadata) ? input.metadata : {};
     const parsed = parseTraceparent(stringField(metadata, "traceparent"));
     if (!parsed) return;
-    this.input.state.sessionTraceContext.set(input.sessionID, parsed);
+    this.input.state.sessionTraceContext.set(input.sessionID, {
+      traceId: parsed.traceId,
+      rootObservationId: parsed.parentObservationId,
+    });
   }
 
   hasSessionTraceContext(sessionID: string) {
