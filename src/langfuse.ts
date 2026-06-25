@@ -68,10 +68,16 @@ type ToolObservation = {
   tool: string;
 };
 
+type TraceContext = {
+  traceId: string;
+  rootObservationId?: string;
+};
+
 type LangfuseTraceState = {
   environment: string;
   traceId: string;
   rootObservationId?: string;
+  sessionTraceContext: Map<string, TraceContext>;
   tracedMessageIds: Set<string>;
   tracedGenerationIds: Set<string>;
   tracedEventIds: Set<string>;
@@ -167,6 +173,14 @@ export class LangfuseClient {
     this.input.state.latestTurnBySession.clear();
   }
 
+  rememberSession(input: { sessionID: string; metadata?: unknown }) {
+    if (!input.sessionID) return;
+    const metadata = isRecord(input.metadata) ? input.metadata : {};
+    const parsed = parseTraceparent(stringField(metadata, "traceparent"));
+    if (!parsed) return;
+    this.input.state.sessionTraceContext.set(input.sessionID, parsed);
+  }
+
   traceEvent(input: {
     id: string;
     sessionID: string;
@@ -186,7 +200,7 @@ export class LangfuseClient {
       timestamp: iso(input.timestamp),
       body: compact({
         id: stableObservationId(`event:${input.id}`),
-        traceId: this.input.state.traceId,
+        traceId: this.traceIdForSession(input.sessionID),
         parentObservationId: this.parentForSession(input.sessionID),
         name: input.name,
         startTime: iso(input.timestamp),
@@ -244,8 +258,8 @@ export class LangfuseClient {
       timestamp: new Date().toISOString(),
       body: compact({
         id: turnId,
-        traceId: this.input.state.traceId,
-        parentObservationId: this.input.state.rootObservationId,
+        traceId: this.traceIdForSession(input.sessionID),
+        parentObservationId: this.rootForSession(input.sessionID),
         name: "opencode.turn",
         startTime: new Date().toISOString(),
         input: formattedInput,
@@ -277,7 +291,7 @@ export class LangfuseClient {
         id: stableObservationId(
           `user:${input.sessionID}:${input.messageID ?? randomUUID()}`,
         ),
-        traceId: this.input.state.traceId,
+        traceId: this.traceIdForSession(input.sessionID),
         parentObservationId: turnId,
         name: "opencode.message.user",
         startTime: new Date().toISOString(),
@@ -450,7 +464,7 @@ export class LangfuseClient {
       timestamp: iso(input.timestamp),
       body: compact({
         id,
-        traceId: this.input.state.traceId,
+        traceId: this.traceIdForSession(input.sessionID),
         parentObservationId: this.parentForSession(input.sessionID),
         name: "opencode.generation",
         startTime: iso(input.timestamp),
@@ -585,7 +599,7 @@ export class LangfuseClient {
       timestamp: iso(input.timestamp),
       body: compact({
         id: stableObservationId(`reasoning:${input.reasoningID}`),
-        traceId: this.input.state.traceId,
+        traceId: this.traceIdForSession(input.sessionID),
         parentObservationId:
           this.generationParent(input.assistantMessageID) ??
           this.parentForSession(input.sessionID),
@@ -631,7 +645,10 @@ export class LangfuseClient {
       {
         asType: "tool",
         startTime: new Date(input.timestamp ?? Date.now()),
-        parentSpanContext: this.parentSpanContext(parentObservationId),
+        parentSpanContext: this.parentSpanContext(
+          input.sessionID,
+          parentObservationId,
+        ),
       },
     );
     this.input.state.activeTools.set(input.callID, {
@@ -706,7 +723,7 @@ export class LangfuseClient {
   private parentForSession(sessionID: string) {
     return (
       this.input.state.latestTurnBySession.get(sessionID)?.id ??
-      this.input.state.rootObservationId
+      this.rootForSession(sessionID)
     );
   }
 
@@ -716,16 +733,34 @@ export class LangfuseClient {
     )?.id;
   }
 
-  private parentSpanContext(parentObservationId: string | undefined) {
+  private traceIdForSession(sessionID: string) {
+    return (
+      this.input.state.sessionTraceContext.get(sessionID)?.traceId ??
+      this.input.state.traceId
+    );
+  }
+
+  private rootForSession(sessionID: string) {
+    return (
+      this.input.state.sessionTraceContext.get(sessionID)?.rootObservationId ??
+      this.input.state.rootObservationId
+    );
+  }
+
+  private parentSpanContext(
+    sessionID: string,
+    parentObservationId: string | undefined,
+  ) {
+    const traceId = this.traceIdForSession(sessionID);
     if (
       !parentObservationId ||
-      !isTraceId(this.input.state.traceId) ||
+      !isTraceId(traceId) ||
       !isSpanId(parentObservationId)
     ) {
       return undefined;
     }
     return {
-      traceId: this.input.state.traceId,
+      traceId,
       spanId: parentObservationId,
       traceFlags: TraceFlags.SAMPLED,
       isRemote: true,
@@ -784,6 +819,7 @@ export const createLangfuseClient = (input: {
       environment: input.environment,
       traceId: parsed?.traceId ?? stableTraceId(randomUUID()),
       rootObservationId: parsed?.parentObservationId,
+      sessionTraceContext: new Map<string, TraceContext>(),
       tracedMessageIds: new Set<string>(),
       tracedGenerationIds: new Set<string>(),
       tracedEventIds: new Set<string>(),
@@ -903,6 +939,10 @@ function recordField(value: unknown, key: string): Record<string, unknown> {
   return field && typeof field === "object"
     ? (field as Record<string, unknown>)
     : {};
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
 }
 
 function stringField(value: unknown, key: string): string {

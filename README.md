@@ -4,7 +4,7 @@ OpenCode plugin that sends OpenCode session telemetry to Langfuse. It traces use
 
 This fork traces the stable OpenCode plugin event stream. It supports the common `message.updated` / `message.part.updated` events used by OpenCode server integrations, and also accepts `session.next.*` events when an OpenCode version delivers them through the plugin hook. It does not poll completed session messages to reconstruct traces.
 
-If `OPENCODE_TRACEPARENT` or `TRACEPARENT` is set, plugin spans join that W3C trace. This lets a host application create a platform trace first, start OpenCode with the traceparent in the environment, and get OpenCode generation/tool/reasoning spans as children of the platform trace.
+If `OPENCODE_TRACEPARENT` or `TRACEPARENT` is set, plugin spans join that W3C trace. For long-lived OpenCode hosts, put `traceparent` in OpenCode session metadata instead; the plugin will use the session metadata parent for observations from that session. This lets a host application reuse one OpenCode server while each OpenCode session still joins the correct platform trace.
 
 Plugin hooks are serialized in arrival order inside the plugin. This keeps message-update observations idempotent when OpenCode emits repeated part updates, and preserves `session.next.*` ordering when those events are available. The plugin also accepts deprecated `session.idle` events for older OpenCode versions.
 
@@ -28,7 +28,15 @@ OpenCode native `experimental.openTelemetry` is optional and separate. This plug
 
 ## Host-Managed OpenCode Servers
 
-Use this plugin when OpenCode's plugin runtime is the telemetry boundary, including host-managed `opencode serve` deployments. Host applications should pass `TRACEPARENT` or `OPENCODE_TRACEPARENT` to the OpenCode process when they want OpenCode observations to join an existing platform trace. The host can still consume OpenCode's `/event` stream for live UI; this plugin uses OpenCode's native plugin hooks for durable Langfuse generation/tool/reasoning traces.
+Use this plugin when OpenCode's plugin runtime is the telemetry boundary, including host-managed `opencode serve` deployments. Host applications can pass `TRACEPARENT` or `OPENCODE_TRACEPARENT` to a short-lived OpenCode process. For reused hosts, create each OpenCode session with metadata like:
+
+```json
+{
+  "traceparent": "00-<trace-id>-<parent-observation-id>-01"
+}
+```
+
+The host can still consume OpenCode's `/event` stream for live UI; this plugin uses OpenCode's native plugin hooks for durable Langfuse generation/tool/reasoning traces.
 
 ## Langfuse Credentials
 

@@ -224,6 +224,20 @@ const eventHook = (event: OpencodeEvent) =>
       yield* langfuse.shutdown;
     }
 
+    if (event.type === "session.created" || event.type === "session.updated") {
+      const info = sessionInfo(event);
+      const sessionID =
+        stringValue(info?.id) ||
+        stringValue(info?.sessionID) ||
+        stringValue(eventProperties(event)?.sessionID);
+      if (sessionID) {
+        langfuse.rememberSession({
+          sessionID,
+          metadata: info?.metadata,
+        });
+      }
+    }
+
     if (event.type === "message.updated") {
       langfuse.traceMessageUpdated({
         sessionID: event.properties.info.sessionID,
@@ -512,6 +526,16 @@ function eventProperties(event: unknown): Record<string, unknown> | undefined {
   if (!isRecord(event)) return undefined;
   const properties = event.properties;
   return isRecord(properties) ? properties : undefined;
+}
+
+function sessionInfo(event: unknown): Record<string, unknown> | undefined {
+  const properties = eventProperties(event);
+  const info = properties?.info;
+  return isRecord(info) ? info : undefined;
+}
+
+function stringValue(value: unknown): string {
+  return typeof value === "string" ? value : "";
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
