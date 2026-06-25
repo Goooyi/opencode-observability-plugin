@@ -3,6 +3,10 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 import type { Hooks, Plugin } from "@opencode-ai/plugin";
+import {
+  createOpencodeClient as createOpencodeV2Client,
+  type OpencodeClient as OpencodeV2Client,
+} from "@opencode-ai/sdk/v2";
 import { Data, Effect, Layer, Schema } from "effect";
 
 import {
@@ -367,6 +371,28 @@ const eventHook = (event: OpencodeEvent) =>
     }
   });
 
+const rememberSessionFromClient = (input: {
+  client: OpencodeV2Client;
+  langfuse: import("./langfuse.js").LangfuseClient;
+  sessionID: string;
+  directory: string;
+}) =>
+  Effect.tryPromise({
+    try: async () => {
+      if (input.langfuse.hasSessionTraceContext(input.sessionID)) return;
+      const response = await input.client.session.get<true>(
+        { sessionID: input.sessionID, directory: input.directory },
+        { throwOnError: true },
+      );
+      const data = isRecord(response.data) ? response.data : undefined;
+      input.langfuse.rememberSession({
+        sessionID: input.sessionID,
+        metadata: data?.metadata,
+      });
+    },
+    catch: (error) => error,
+  }).pipe(Effect.catchAll(() => Effect.void));
+
 const formatHookError = (error: unknown) => {
   if (error instanceof Error) {
     return error.stack ?? error.message;
@@ -379,136 +405,148 @@ const formatHookError = (error: unknown) => {
   }
 };
 
-const main = Effect.gen(function* () {
-  const opencode = yield* OpencodeClientService;
+const main = (context: { v2Client: OpencodeV2Client; directory: string }) =>
+  Effect.gen(function* () {
+    const opencode = yield* OpencodeClientService;
 
-  const langfuse = yield* Effect.gen(function* () {
-    const credentials = yield* loadLangfuseCredentials;
+    const langfuse = yield* Effect.gen(function* () {
+      const credentials = yield* loadLangfuseCredentials;
 
-    const baseUrl =
-      credentials.baseUrl ??
-      process.env.LANGFUSE_BASEURL ??
-      "https://cloud.langfuse.com";
+      const baseUrl =
+        credentials.baseUrl ??
+        process.env.LANGFUSE_BASEURL ??
+        "https://cloud.langfuse.com";
 
-    const environment =
-      credentials.environment ??
-      process.env.LANGFUSE_ENVIRONMENT ??
-      "development";
+      const environment =
+        credentials.environment ??
+        process.env.LANGFUSE_ENVIRONMENT ??
+        "development";
 
-    const userId = credentials.userId ?? process.env.LANGFUSE_USER_ID;
+      const userId = credentials.userId ?? process.env.LANGFUSE_USER_ID;
 
-    return yield* createLangfuseClient({
-      publicKey: credentials.publicKey,
-      secretKey: credentials.secretKey,
-      baseUrl,
-      environment,
-      userId,
-    });
-  }).pipe(
-    Effect.tap((client) =>
-      log("info", `OTEL tracing initialized → ${client.baseUrl}`),
-    ),
-    Effect.catchTag("MissingLangfuseCredentials", () =>
-      log("warn", "[Tracing disabled] Missing langfuse credentials"),
-    ),
-  );
-
-  if (!langfuse) {
-    return {};
-  }
-
-  const hooksLayer = Layer.merge(
-    Layer.succeed(OpencodeClientService, opencode),
-    Layer.succeed(LangfuseClientService, langfuse),
-  );
-
-  const runHook = (
-    hookName: string,
-    effect: Effect.Effect<
-      unknown,
-      unknown,
-      OpencodeClientService | LangfuseClientService
-    >,
-  ) =>
-    Effect.runPromise(
-      effect.pipe(
-        Effect.catchAllDefect((defect) =>
-          log(
-            "error",
-            `Langfuse hook "${hookName}" failed: ${formatHookError(defect)}`,
-          ).pipe(Effect.catchAll(() => Effect.void)),
-        ),
-        Effect.catchAll((error) =>
-          log(
-            "error",
-            `Langfuse hook "${hookName}" failed: ${formatHookError(error)}`,
-          ).pipe(Effect.catchAll(() => Effect.void)),
-        ),
-        Effect.asVoid,
-        Effect.provide(hooksLayer),
+      return yield* createLangfuseClient({
+        publicKey: credentials.publicKey,
+        secretKey: credentials.secretKey,
+        baseUrl,
+        environment,
+        userId,
+      });
+    }).pipe(
+      Effect.tap((client) =>
+        log("info", `OTEL tracing initialized → ${client.baseUrl}`),
+      ),
+      Effect.catchTag("MissingLangfuseCredentials", () =>
+        log("warn", "[Tracing disabled] Missing langfuse credentials"),
       ),
     );
 
-  let hookQueue = Promise.resolve();
-  const enqueueHook = (
-    hookName: string,
-    effect: Effect.Effect<
-      unknown,
-      unknown,
-      OpencodeClientService | LangfuseClientService
-    >,
-  ) => {
-    hookQueue = hookQueue.then(
-      () => runHook(hookName, effect),
-      () => runHook(hookName, effect),
+    if (!langfuse) {
+      return {};
+    }
+
+    const hooksLayer = Layer.merge(
+      Layer.succeed(OpencodeClientService, opencode),
+      Layer.succeed(LangfuseClientService, langfuse),
     );
-    return hookQueue;
-  };
-  const hooks: Hooks = {
-    dispose: async () => {
-      await hookQueue.catch(() => undefined);
-      await runHook(
-        "dispose",
-        Effect.gen(function* () {
-          langfuse.endActiveToolObservations();
-          langfuse.endActiveGenerationSteps();
-          langfuse.endActiveTurnObservations();
-          langfuse.clearTraceState();
-          yield* langfuse.shutdown;
-        }),
+
+    const runHook = (
+      hookName: string,
+      effect: Effect.Effect<
+        unknown,
+        unknown,
+        OpencodeClientService | LangfuseClientService
+      >,
+    ) =>
+      Effect.runPromise(
+        effect.pipe(
+          Effect.catchAllDefect((defect) =>
+            log(
+              "error",
+              `Langfuse hook "${hookName}" failed: ${formatHookError(defect)}`,
+            ).pipe(Effect.catchAll(() => Effect.void)),
+          ),
+          Effect.catchAll((error) =>
+            log(
+              "error",
+              `Langfuse hook "${hookName}" failed: ${formatHookError(error)}`,
+            ).pipe(Effect.catchAll(() => Effect.void)),
+          ),
+          Effect.asVoid,
+          Effect.provide(hooksLayer),
+        ),
       );
-    },
 
-    event: ({ event }) => {
-      void enqueueHook("event", eventHook(event));
-      return Promise.resolve();
-    },
+    let hookQueue = Promise.resolve();
+    const enqueueHook = (
+      hookName: string,
+      effect: Effect.Effect<
+        unknown,
+        unknown,
+        OpencodeClientService | LangfuseClientService
+      >,
+    ) => {
+      hookQueue = hookQueue.then(
+        () => runHook(hookName, effect),
+        () => runHook(hookName, effect),
+      );
+      return hookQueue;
+    };
+    const hooks: Hooks = {
+      dispose: async () => {
+        await hookQueue.catch(() => undefined);
+        await runHook(
+          "dispose",
+          Effect.gen(function* () {
+            langfuse.endActiveToolObservations();
+            langfuse.endActiveGenerationSteps();
+            langfuse.endActiveTurnObservations();
+            langfuse.clearTraceState();
+            yield* langfuse.shutdown;
+          }),
+        );
+      },
 
-    "chat.message": (input, output) => {
-      void enqueueHook(
-        "chat.message",
-        Effect.try({
-          try: () =>
+      event: ({ event }) => {
+        void enqueueHook("event", eventHook(event));
+        return Promise.resolve();
+      },
+
+      "chat.message": (input, output) => {
+        void enqueueHook(
+          "chat.message",
+          Effect.gen(function* () {
+            yield* rememberSessionFromClient({
+              client: context.v2Client,
+              langfuse,
+              sessionID: input.sessionID,
+              directory: context.directory,
+            });
             langfuse.traceUserMessage({
               sessionID: input.sessionID,
               messageID: input.messageID,
               agent: input.agent,
               model: input.model,
               parts: output.parts,
-            }),
-          catch: (error) => error,
-        }),
-      );
-      return Promise.resolve();
-    },
-  };
+            });
+          }),
+        );
+        return Promise.resolve();
+      },
+    };
 
-  return hooks;
-});
+    return hooks;
+  });
 
-export const LangfusePlugin: Plugin = async ({ client }) => {
+export const LangfusePlugin: Plugin = async ({
+  client,
+  serverUrl,
+  directory,
+}) => {
+  const v2Client = createOpencodeV2Client({ baseUrl: serverUrl.toString() });
   const clientLayer = Layer.succeed(OpencodeClientService, client);
-  return Effect.runPromise(main.pipe(Effect.provide(clientLayer)));
+  return Effect.runPromise(
+    main({ v2Client, directory }).pipe(Effect.provide(clientLayer)),
+  );
 };
 
 export default LangfusePlugin;

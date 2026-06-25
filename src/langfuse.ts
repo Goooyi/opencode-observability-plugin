@@ -181,6 +181,10 @@ export class LangfuseClient {
     this.input.state.sessionTraceContext.set(input.sessionID, parsed);
   }
 
+  hasSessionTraceContext(sessionID: string) {
+    return this.input.state.sessionTraceContext.has(sessionID);
+  }
+
   traceEvent(input: {
     id: string;
     sessionID: string;

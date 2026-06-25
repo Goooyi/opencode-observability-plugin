@@ -1,6 +1,6 @@
 {
   "name": "@goooyi/opencode-observability-plugin",
-  "version": "0.2.21",
+  "version": "0.2.22",
   "description": "OpenCode plugin that sends session telemetry and reasoning parts to Langfuse.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
